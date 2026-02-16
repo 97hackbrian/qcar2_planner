@@ -70,12 +70,16 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('occupancy_threshold', 0.5)
         self.declare_parameter('safety_margin_cells', 2)
         self.declare_parameter('publish_path_markers', True)
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'base_link')
 
         # ── Read parameters ─────────────────────────────────────────────────
         self.direction_penalty = self.get_parameter('direction_penalty').value
         self.occ_threshold = self.get_parameter('occupancy_threshold').value
         self.safety_margin = self.get_parameter('safety_margin_cells').value
         self.pub_markers = self.get_parameter('publish_path_markers').value
+        self.map_frame = self.get_parameter('map_frame').value
+        self.base_frame = self.get_parameter('base_frame').value
 
         # ── State ───────────────────────────────────────────────────────────
         self.enabled = False      # Set to True when map is READY (via SetBool)
@@ -183,7 +187,7 @@ class DirectionalPlannerServer(Node):
         # ── Get robot's current position from TF ────────────────────────
         try:
             t = self.tf_buffer.lookup_transform(
-                'map', 'base_link', rclpy.time.Time()
+                self.map_frame, self.base_frame, rclpy.time.Time()
             )
             start_x = t.transform.translation.x
             start_y = t.transform.translation.y
@@ -305,8 +309,9 @@ class DirectionalPlannerServer(Node):
         dir_y = self.latest_layers.get('dir_y', np.zeros_like(occupancy))
 
         # ── Inflate obstacles for safety ────────────────────────────────
+        # New occupancy: -1=unknown, 0=free, 1=wall → block everything != 0
         import cv2
-        obstacle_mask = (occupancy >= self.occ_threshold).astype(np.uint8)
+        obstacle_mask = (occupancy != 0.0).astype(np.uint8)
         if self.safety_margin > 0:
             k = 2 * self.safety_margin + 1
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
@@ -420,19 +425,21 @@ class DirectionalPlannerServer(Node):
     # Coordinate conversions
     # =====================================================================
     def _world_to_grid(self, wx, wy):
+        """Convert world → grid. Corner = centre - half-length."""
         res = self.map_info.resolution
-        ox = self.map_info.pose.position.x - self.map_info.length_x / 2.0
-        oy = self.map_info.pose.position.y - self.map_info.length_y / 2.0
-        col = int((wx - ox) / res)
-        row = int((wy - oy) / res)
+        corner_x = self.map_info.pose.position.x - self.map_info.length_x / 2.0
+        corner_y = self.map_info.pose.position.y - self.map_info.length_y / 2.0
+        col = int((wx - corner_x) / res)
+        row = int((wy - corner_y) / res)
         return col, row
 
     def _grid_to_world(self, col, row):
+        """Convert grid → world (cell centre). Corner = centre - half-length."""
         res = self.map_info.resolution
-        ox = self.map_info.pose.position.x - self.map_info.length_x / 2.0
-        oy = self.map_info.pose.position.y - self.map_info.length_y / 2.0
-        wx = col * res + ox + res / 2.0
-        wy = row * res + oy + res / 2.0
+        corner_x = self.map_info.pose.position.x - self.map_info.length_x / 2.0
+        corner_y = self.map_info.pose.position.y - self.map_info.length_y / 2.0
+        wx = corner_x + (col + 0.5) * res
+        wy = corner_y + (row + 0.5) * res
         return float(wx), float(wy)
 
     def _in_bounds(self, col, row):

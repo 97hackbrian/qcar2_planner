@@ -158,9 +158,10 @@ class ExplorationManagerNode(Node):
         # ── Extract working area cells ──────────────────────────────────
         mask = self._working_area_mask(uncertainty)
 
-        # Only consider FREE (non-obstacle) cells for the metric
+        # Only consider FREE cells (occupancy == 0.0) for the metric
+        # New convention: -1=unknown, 0=free, 1=wall
         if occupancy is not None:
-            free_mask = occupancy < 0.5
+            free_mask = occupancy == 0.0
             mask = mask & free_mask
 
         n_cells = np.sum(mask)
@@ -216,13 +217,13 @@ class ExplorationManagerNode(Node):
             return np.ones(layer.shape, dtype=bool)
 
         res = self.map_info.resolution
-        ox = self.map_info.pose.position.x - self.map_info.length_x / 2.0
-        oy = self.map_info.pose.position.y - self.map_info.length_y / 2.0
+        # Corner = centre - half-length (matches map_processor_node convention)
+        corner_x = self.map_info.pose.position.x - self.map_info.length_x / 2.0
+        corner_y = self.map_info.pose.position.y - self.map_info.length_y / 2.0
 
         rows, cols = layer.shape
-        # Create coordinate arrays
-        col_coords = np.arange(cols) * res + ox + res / 2.0
-        row_coords = np.arange(rows) * res + oy + res / 2.0
+        col_coords = corner_x + (np.arange(cols) + 0.5) * res
+        row_coords = corner_y + (np.arange(rows) + 0.5) * res
 
         col_mask = (col_coords >= self.wa_x_min) & (col_coords <= self.wa_x_max)
         row_mask = (row_coords >= self.wa_y_min) & (row_coords <= self.wa_y_max)
@@ -251,7 +252,7 @@ class ExplorationManagerNode(Node):
         grad_y = cv2.Sobel(uncertainty, cv2.CV_32F, 0, 1, ksize=3)
         grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
 
-        # Frontier: high gradient AND within free/working area
+        # Frontier: high gradient AND free cells in working area
         frontier = (grad_mag > self.gradient_threshold) & free_mask
         frontier_u8 = frontier.astype(np.uint8) * 255
 
@@ -317,16 +318,17 @@ class ExplorationManagerNode(Node):
     # Grid ↔ World conversion (using map_info)
     # =====================================================================
     def _grid_to_world(self, col: float, row: float):
-        """Convert grid indices to world coordinates."""
+        """Convert grid indices to world coordinates (cell centre)."""
         if self.map_info is None:
             return 0.0, 0.0
 
         res = self.map_info.resolution
-        ox = self.map_info.pose.position.x - self.map_info.length_x / 2.0
-        oy = self.map_info.pose.position.y - self.map_info.length_y / 2.0
+        # Corner = centre - half-length (matches map_processor_node convention)
+        corner_x = self.map_info.pose.position.x - self.map_info.length_x / 2.0
+        corner_y = self.map_info.pose.position.y - self.map_info.length_y / 2.0
 
-        wx = col * res + ox + res / 2.0
-        wy = row * res + oy + res / 2.0
+        wx = corner_x + (col + 0.5) * res
+        wy = corner_y + (row + 0.5) * res
         return float(wx), float(wy)
 
     # =====================================================================

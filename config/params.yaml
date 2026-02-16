@@ -6,58 +6,64 @@ map_processor_node:
   ros__parameters:
     # --- Input Topics ---
     mesh_marker_topic: "/nvblox_node/mesh_marker"
+    occupancy_grid_topic: "/map" # OccupancyGrid from Cartographer
+
+    # --- Wall Integration ---
+    wall_occupy_threshold: 50 # /map cells >= this → wall (0-100)
 
     # --- TF Frames ---
     map_frame: "map"
-    base_frame: "base_link"
+    base_frame: "odom"
 
-    # --- Grid Map Dimensions ---
-    map_resolution: 0.05        # meters per cell
-    map_size_x: 20.0            # meters (total width)
-    map_size_y: 20.0            # meters (total height)
-    map_origin_x: 0.0           # center of the map in world coords
-    map_origin_y: 0.0
+    # --- Grid Dimensions ---
+    map_resolution: 0.05 # meters per cell
+    map_size_x: 20.0 # total width (m)
+    map_size_y: 20.0 # total height (m)
+    map_origin_x: 0.0 # center in world x
+    map_origin_y: 0.0 # center in world y
 
-    # --- Flattening (3D → 2D) ---
-    z_min: -0.5                 # min z to consider (meters)
-    z_max: 2.0                  # max z to consider (meters)
-
-    # --- Morphological Closure ---
-    kernel_size: 5              # NxN kernel for cv2.morphologyEx(MORPH_CLOSE)
+    # --- Mesh Z-Filter ---
+    z_min: -0.5
+    z_max: 2.0
 
     # --- Uncertainty Model ---
-    hits_threshold: 20          # N_threshold: observations needed for full certainty
+    hits_threshold: 10 # nvblox hits for full certainty
 
     # --- Publishing ---
-    publish_rate: 2.0           # Hz — rate of GridMap publication
+    publish_rate: 2.0 # Hz
 
-    # --- Debug ---
-    show_debug_window: true     # OpenCV imshow of uncertainty heatmap
+    # --- RViz2 Output Topics ---
+    occupancy_out_topic: "/planner_occupancy"
+    uncertainty_out_topic: "/planner_uncertainty"
 
 exploration_manager_node:
   ros__parameters:
-    # --- Uncertainty Threshold (τ) ---
+    # --- Uncertainty Threshold ---
     uncertainty_threshold: 0.15
 
-    # --- Working Area (Lidar range quadrilateral) ---
+    # --- Working Area ---
     work_area_x_min: -10.0
     work_area_x_max: 10.0
     work_area_y_min: -10.0
     work_area_y_max: 10.0
 
     # --- Frontier Detection ---
-    frontier_min_size: 5        # minimum cells to qualify as frontier cluster
-    gradient_threshold: 0.3     # uncertainty gradient to detect frontier boundary
+    frontier_min_size: 5
+    gradient_threshold: 0.3
 
     # --- Publishing ---
-    publish_rate: 1.0           # Hz
+    publish_rate: 1.0
 
 directional_planner_server:
   ros__parameters:
+    # --- TF Frames ---
+    map_frame: "map"
+    base_frame: "odom"
+
     # --- Planner ---
-    direction_penalty: 1.0e6    # large penalty for wrong-way traversal (≈∞)
-    occupancy_threshold: 0.5    # cells with occupancy above this are obstacles
-    safety_margin_cells: 2      # inflate obstacles by this many cells
+    direction_penalty: 1.0e6
+    occupancy_threshold: 0.5
+    safety_margin_cells: 2
 
     # --- Debug ---
-    publish_path_markers: true  # publish arrow MarkerArray on /path_arrows
+    publish_path_markers: true
