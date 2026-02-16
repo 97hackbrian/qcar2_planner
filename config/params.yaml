@@ -30,7 +30,7 @@ map_processor_node:
     hits_threshold: 10 # nvblox hits for full certainty
 
     # --- Publishing ---
-    publish_rate: 2.0 # Hz
+    publish_rate: 20.0 # Hz
 
     # --- RViz2 Output Topics ---
     occupancy_out_topic: "/planner_occupancy"
@@ -52,7 +52,7 @@ exploration_manager_node:
     gradient_threshold: 0.3
 
     # --- Publishing ---
-    publish_rate: 1.0
+    publish_rate: 20.0
 
 directional_planner_server:
   ros__parameters:
