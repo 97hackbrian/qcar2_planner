@@ -51,8 +51,8 @@ exploration_manager_node:
     frontier_min_size: 5
     gradient_threshold: 0.3
 
-    # --- Publishing ---
-    publish_rate: 1.0  # Hz (frontier evaluation rate)
+    # --- Evaluation & Publishing ---
+    publish_rate: 1.0  # Hz (controls how often frontiers are evaluated and goals/markers published)
 
 directional_planner_server:
   ros__parameters:

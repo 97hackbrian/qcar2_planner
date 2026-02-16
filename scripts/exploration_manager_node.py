@@ -284,6 +284,15 @@ class ExplorationManagerNode(Node):
         clusters.sort(key=lambda c: c[0], reverse=True)
 
         if not clusters:
+            # Clear stale markers from previous cycles
+            empty_markers = MarkerArray()
+            clear_marker = Marker()
+            clear_marker.header.stamp = self.get_clock().now().to_msg()
+            clear_marker.header.frame_id = 'map'
+            clear_marker.ns = 'frontiers'
+            clear_marker.action = Marker.DELETEALL
+            empty_markers.markers.append(clear_marker)
+            self.marker_pub.publish(empty_markers)
             return
 
         stamp = self.get_clock().now().to_msg()
