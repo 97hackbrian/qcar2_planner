@@ -113,27 +113,32 @@ class ExplorationManagerNode(Node):
         for i, name in enumerate(msg.layers):
             arr = msg.data[i]
 
-            # grid_map convention: dim[0] = column_index, dim[1] = row_index
+            # grid_map convention: dim[0] = column_index (Eigen cols = n_y)
+            #                      dim[1] = row_index   (Eigen rows = n_x)
             if len(arr.layout.dim) >= 2:
-                cols = arr.layout.dim[0].size  # column_index
-                rows = arr.layout.dim[1].size  # row_index
+                n_y = arr.layout.dim[0].size  # Eigen cols = cells along Y
+                n_x = arr.layout.dim[1].size  # Eigen rows = cells along X
             else:
                 # Fallback: use map info
                 if self.map_info is not None:
-                    cols = int(self.map_info.length_x / self.map_info.resolution)
-                    rows = int(self.map_info.length_y / self.map_info.resolution)
+                    n_x = int(self.map_info.length_x / self.map_info.resolution)
+                    n_y = int(self.map_info.length_y / self.map_info.resolution)
                 else:
                     continue
 
-            # Reconstruct from column-major (Fortran) order
-            data = np.array(arr.data, dtype=np.float32).reshape(
-                (rows, cols), order='F'
+            # Deserialize column-major → Eigen shape (n_x, n_y)
+            eigen_data = np.array(arr.data, dtype=np.float32).reshape(
+                (n_x, n_y), order='F'
             )
+            # Convert Eigen → our numpy: (n_x, n_y) → (n_y, n_x)
+            # Eigen row0=maxX, col0=maxY → numpy row0=minY, col0=minX
+            data = eigen_data.T[::-1, ::-1]
             layers[name] = data
 
         self.latest_gridmap = layers
-        self.grid_rows = rows
-        self.grid_cols = cols
+        if layers:
+            sample = next(iter(layers.values()))
+            self.grid_rows, self.grid_cols = sample.shape  # (n_y, n_x)
 
     # =====================================================================
     # Periodic evaluation — state machine

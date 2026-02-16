@@ -429,17 +429,27 @@ class MapProcessorNode(Node):
 
         for layer_data in arrays:
             arr = Float32MultiArray()
+            # grid_map Eigen convention:
+            #   Eigen rows = n_x (cells along X), row 0 = max X
+            #   Eigen cols = n_y (cells along Y), col 0 = max Y
+            #   dim[0] = column_index = Eigen cols = n_y
+            #   dim[1] = row_index   = Eigen rows = n_x
+            n_x = self.cols  # cells along X
+            n_y = self.rows  # cells along Y
             d0 = MultiArrayDimension()
             d0.label = 'column_index'
-            d0.size = int(self.cols)
-            d0.stride = int(self.rows * self.cols)
+            d0.size = n_y
+            d0.stride = n_x * n_y
             d1 = MultiArrayDimension()
             d1.label = 'row_index'
-            d1.size = int(self.rows)
-            d1.stride = int(self.rows)
+            d1.size = n_x
+            d1.stride = n_x
             arr.layout.dim = [d0, d1]
             arr.layout.data_offset = 0
-            arr.data = layer_data.astype(np.float32).flatten(order='F').tolist()
+            # Transform: numpy (n_y, n_x) → Eigen (n_x, n_y)
+            # numpy[y,x] row0=minY, col0=minX → Eigen[x,y] row0=maxX, col0=maxY
+            eigen_data = layer_data[::-1, ::-1].T.astype(np.float32)
+            arr.data = eigen_data.flatten(order='F').tolist()
             msg.data.append(arr)
 
         msg.outer_start_index = 0

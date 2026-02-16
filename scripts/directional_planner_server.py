@@ -126,20 +126,24 @@ class DirectionalPlannerServer(Node):
     # GridMap callback
     # =====================================================================
     def gridmap_callback(self, msg: GridMapMsg):
-        """Parse and store latest GridMap layers (column-major convention)."""
+        """Parse and store latest GridMap layers (Eigen → numpy convention)."""
         self.map_info = msg.info
         layers = {}
         for i, name in enumerate(msg.layers):
             arr = msg.data[i]
-            # grid_map convention: dim[0] = column_index, dim[1] = row_index
+            # dim[0] = column_index (Eigen cols = n_y)
+            # dim[1] = row_index   (Eigen rows = n_x)
             if len(arr.layout.dim) >= 2:
-                cols = arr.layout.dim[0].size  # column_index
-                rows = arr.layout.dim[1].size  # row_index
+                n_y = arr.layout.dim[0].size
+                n_x = arr.layout.dim[1].size
             else:
                 continue
-            data = np.array(arr.data, dtype=np.float32).reshape(
-                (rows, cols), order='F'
+            # Deserialize column-major → Eigen (n_x, n_y)
+            eigen_data = np.array(arr.data, dtype=np.float32).reshape(
+                (n_x, n_y), order='F'
             )
+            # Convert Eigen → numpy: row0=maxX,col0=maxY → row0=minY,col0=minX
+            data = eigen_data.T[::-1, ::-1]
             layers[name] = data
 
         self.latest_layers = layers
