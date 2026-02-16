@@ -37,6 +37,8 @@ from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 import tf2_ros
 from tf2_ros import Buffer, TransformListener
 
+MIN_MORPH_KERNEL = 3
+
 
 class MapProcessorNode(Node):
     """Fuses /map (Cartographer) with nvblox mesh to compute uncertainty."""
@@ -187,12 +189,16 @@ class MapProcessorNode(Node):
             result = np.full(sub.shape, -1.0, dtype=np.float32)
             result[(sub >= 0) & (sub < self.wall_threshold)] = 0.0
             result[sub >= self.wall_threshold] = 1.0
-            if self.morph_kernel >= 3:
+            if self.morph_kernel >= MIN_MORPH_KERNEL:
                 k = self.morph_kernel if self.morph_kernel % 2 == 1 else self.morph_kernel + 1
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
                 free_u8 = (result == 0.0).astype(np.uint8) * 255
                 free_closed = cv2.morphologyEx(free_u8, cv2.MORPH_CLOSE, kernel)
-                result[sub >= 0] = np.where(free_closed > 0, 0.0, 1.0)[sub >= 0]
+                closed_result = np.where(free_closed > 0, 0.0, 1.0).astype(np.float32)
+                known_mask = sub >= 0
+                occupied_mask = sub >= self.wall_threshold
+                result[known_mask] = closed_result[known_mask]
+                result[occupied_mask] = 1.0
 
             with self.lock:
                 self.occupancy[np.ix_(dst_r, dst_c)] = result
