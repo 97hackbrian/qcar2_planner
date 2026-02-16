@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+# =============================================================================
+# exploration_manager_node.py — State Monitor (Node 2)
+# =============================================================================
+#
+# Monitors the mapping progress by computing the mean uncertainty over the
+# working area. Manages two states:
+#
+#   MAPPING:  U_bar > τ  →  publish PoseStamped goals at frontier centroids
+#   READY:    U_bar ≤ τ  →  enable the directional planner via SetBool
+#
+# FRONTIER DETECTION:
+#   Frontiers are regions with a high gradient of uncertainty, indicating the
+#   boundary between mapped (certain) and unmapped (uncertain) areas. The node
+#   clusters these frontier cells and publishes goals at their centroids.
+#
+# METRIC:
+#   U_bar = (1/N) * Σ U_i  (mean uncertainty over track cells in working area)
+#
+# GUARDRAIL: This node does NOT publish any motor commands.
+# =============================================================================
+
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+
+from grid_map_msgs.msg import GridMap as GridMapMsg
+from geometry_msgs.msg import PoseStamped
+from visualization_msgs.msg import Marker, MarkerArray
+from std_srvs.srv import SetBool
+
+
+class ExplorationManagerNode(Node):
+    """Manages exploration state and frontier goal generation."""
+
+    # States
+    STATE_MAPPING = 'MAPPING'
+    STATE_READY = 'READY'
+
+    def __init__(self):
+        super().__init__('exploration_manager_node')
+
+        # ── Declare parameters ──────────────────────────────────────────────
+        self.declare_parameter('uncertainty_threshold', 0.15)
+        self.declare_parameter('work_area_x_min', -10.0)
+        self.declare_parameter('work_area_x_max', 10.0)
+        self.declare_parameter('work_area_y_min', -10.0)
+        self.declare_parameter('work_area_y_max', 10.0)
+        self.declare_parameter('frontier_min_size', 5)
+        self.declare_parameter('gradient_threshold', 0.3)
+        self.declare_parameter('publish_rate', 1.0)
+
+        # ── Read parameters ─────────────────────────────────────────────────
+        self.tau = self.get_parameter('uncertainty_threshold').value
+        self.wa_x_min = self.get_parameter('work_area_x_min').value
+        self.wa_x_max = self.get_parameter('work_area_x_max').value
+        self.wa_y_min = self.get_parameter('work_area_y_min').value
+        self.wa_y_max = self.get_parameter('work_area_y_max').value
+        self.frontier_min_size = self.get_parameter('frontier_min_size').value
+        self.gradient_threshold = self.get_parameter('gradient_threshold').value
+        self.publish_rate = self.get_parameter('publish_rate').value
+
+        # ── State ───────────────────────────────────────────────────────────
+        self.state = self.STATE_MAPPING
+        self.latest_gridmap = None
+        self.map_info = None
+        self.planner_enabled = False
+
+        # ── Subscribers ─────────────────────────────────────────────────────
+        self.gridmap_sub = self.create_subscription(
+            GridMapMsg, '/grid_map', self.gridmap_callback, 10
+        )
+
+        # ── Publishers ──────────────────────────────────────────────────────
+        self.goal_pub = self.create_publisher(
+            PoseStamped, '/exploration_goal', 10
+        )
+        self.marker_pub = self.create_publisher(
+            MarkerArray, '/frontier_markers', 10
+        )
+
+        # ── Service client for enabling the planner (Node 3) ────────────────
+        self.enable_client = self.create_client(
+            SetBool, '/enable_planner'
+        )
+
+        # ── Timer ───────────────────────────────────────────────────────────
+        period = 1.0 / self.publish_rate
+        self.timer = self.create_timer(period, self.evaluate)
+
+        self.get_logger().info(
+            f'ExplorationManagerNode initialized: τ={self.tau}, '
+            f'work_area=[{self.wa_x_min},{self.wa_x_max}]×'
+            f'[{self.wa_y_min},{self.wa_y_max}]'
+        )
+
+    # =====================================================================
+    # GridMap callback — deserialize layers from grid_map_msgs/GridMap
+    # =====================================================================
+    def gridmap_callback(self, msg: GridMapMsg):
+        """
+        Parse the incoming GridMap message and store the numpy layers.
+        Uses column-major (Fortran) order matching grid_map_ros convention.
+        """
+        self.map_info = msg.info
+
+        # Build a dict of layer_name → numpy array
+        layers = {}
+        rows = 0
+        cols = 0
+
+        for i, name in enumerate(msg.layers):
+            arr = msg.data[i]
+
+            # grid_map convention: dim[0] = column_index, dim[1] = row_index
+            if len(arr.layout.dim) >= 2:
+                cols = arr.layout.dim[0].size  # column_index
+                rows = arr.layout.dim[1].size  # row_index
+            else:
+                # Fallback: use map info
+                if self.map_info is not None:
+                    cols = int(self.map_info.length_x / self.map_info.resolution)
+                    rows = int(self.map_info.length_y / self.map_info.resolution)
+                else:
+                    continue
+
+            # Reconstruct from column-major (Fortran) order
+            data = np.array(arr.data, dtype=np.float32).reshape(
+                (rows, cols), order='F'
+            )
+            layers[name] = data
+
+        self.latest_gridmap = layers
+        self.grid_rows = rows
+        self.grid_cols = cols
+
+    # =====================================================================
+    # Periodic evaluation — state machine
+    # =====================================================================
+    def evaluate(self):
+        """
+        Main logic loop:
+        1. Compute mean uncertainty over the working area (track cells only)
+        2. If MAPPING and U_bar > τ  → find & publish frontier goals
+        3. If MAPPING and U_bar ≤ τ  → switch to READY, enable planner
+        """
+        if self.latest_gridmap is None or 'uncertainty' not in self.latest_gridmap:
+            self.get_logger().info(
+                'Waiting for GridMap data...',
+                throttle_duration_sec=5.0
+            )
+            return
+
+        uncertainty = self.latest_gridmap['uncertainty']
+        occupancy = self.latest_gridmap.get('occupancy', None)
+
+        # ── Extract working area cells ──────────────────────────────────
+        mask = self._working_area_mask(uncertainty)
+
+        # Only consider FREE (non-obstacle) cells for the metric
+        if occupancy is not None:
+            free_mask = occupancy < 0.5
+            mask = mask & free_mask
+
+        n_cells = np.sum(mask)
+        if n_cells == 0:
+            self.get_logger().warn(
+                'No free cells in working area yet',
+                throttle_duration_sec=5.0
+            )
+            return
+
+        # ── Mean uncertainty: U_bar = (1/N) * Σ U_i ────────────────────
+        u_values = uncertainty[mask]
+        u_bar = float(np.mean(u_values))
+        mapped_pct = float(np.mean(u_values < 0.5)) * 100.0
+
+        self.get_logger().info(
+            f'[{self.state}] Mean uncertainty: {u_bar:.3f} | '
+            f'Mapped with certainty: {mapped_pct:.1f}% | '
+            f'Threshold τ: {self.tau}'
+        )
+
+        # ── State logic ─────────────────────────────────────────────────
+        if self.state == self.STATE_MAPPING:
+            if u_bar > self.tau:
+                # Still mapping — find and publish frontier goals
+                self._publish_frontier_goals(uncertainty, mask)
+            else:
+                # Map is complete! Switch to READY
+                self.state = self.STATE_READY
+                self.get_logger().info(
+                    '═══════════════════════════════════════════════\n'
+                    '  ✅ MAP COMPLETE — Switching to READY state\n'
+                    f'  Final mean uncertainty: {u_bar:.4f} ≤ {self.tau}\n'
+                    '  Enabling directional planner service...\n'
+                    '═══════════════════════════════════════════════'
+                )
+                self._enable_planner()
+
+        elif self.state == self.STATE_READY:
+            self.get_logger().debug(
+                f'READY — Planner enabled. Map certainty: {mapped_pct:.1f}%'
+            )
+
+    # =====================================================================
+    # Working area mask
+    # =====================================================================
+    def _working_area_mask(self, layer: np.ndarray) -> np.ndarray:
+        """
+        Create a boolean mask for cells within the working area quadrilateral
+        defined by lidar range bounds.
+        """
+        if self.map_info is None:
+            return np.ones(layer.shape, dtype=bool)
+
+        res = self.map_info.resolution
+        ox = self.map_info.pose.position.x - self.map_info.length_x / 2.0
+        oy = self.map_info.pose.position.y - self.map_info.length_y / 2.0
+
+        rows, cols = layer.shape
+        # Create coordinate arrays
+        col_coords = np.arange(cols) * res + ox + res / 2.0
+        row_coords = np.arange(rows) * res + oy + res / 2.0
+
+        col_mask = (col_coords >= self.wa_x_min) & (col_coords <= self.wa_x_max)
+        row_mask = (row_coords >= self.wa_y_min) & (row_coords <= self.wa_y_max)
+
+        return np.outer(row_mask, col_mask)
+
+    # =====================================================================
+    # Frontier detection and goal publication
+    # =====================================================================
+    def _publish_frontier_goals(self, uncertainty: np.ndarray, free_mask: np.ndarray):
+        """
+        Detect frontiers: cells with HIGH gradient of uncertainty, meaning
+        they are at the boundary between mapped and unmapped areas.
+
+        Steps:
+          1. Compute gradient magnitude of the uncertainty layer
+          2. Threshold to get frontier cells
+          3. Cluster frontier cells (connected components)
+          4. Publish PoseStamped at the centroid of each cluster
+          5. Visualize with MarkerArray
+        """
+        import cv2
+
+        # Gradient magnitude (Sobel)
+        grad_x = cv2.Sobel(uncertainty, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(uncertainty, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+        # Frontier: high gradient AND within free/working area
+        frontier = (grad_mag > self.gradient_threshold) & free_mask
+        frontier_u8 = frontier.astype(np.uint8) * 255
+
+        # Connected components
+        n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            frontier_u8, connectivity=8
+        )
+
+        marker_array = MarkerArray()
+        goal_published = False
+
+        for label_id in range(1, n_labels):  # skip background (0)
+            area = stats[label_id, cv2.CC_STAT_AREA]
+            if area < self.frontier_min_size:
+                continue
+
+            # Centroid in pixel coordinates → world coordinates
+            cx_px, cy_px = centroids[label_id]
+            wx, wy = self._grid_to_world(cx_px, cy_px)
+
+            # Publish PoseStamped goal (only the largest/first frontier)
+            if not goal_published:
+                goal = PoseStamped()
+                goal.header.stamp = self.get_clock().now().to_msg()
+                goal.header.frame_id = 'map'
+                goal.pose.position.x = wx
+                goal.pose.position.y = wy
+                goal.pose.position.z = 0.0
+                goal.pose.orientation.w = 1.0
+                self.goal_pub.publish(goal)
+                goal_published = True
+
+                self.get_logger().info(
+                    f'Published frontier goal: ({wx:.2f}, {wy:.2f}), '
+                    f'cluster size={area} cells'
+                )
+
+            # Visualization marker
+            marker = Marker()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'map'
+            marker.ns = 'frontiers'
+            marker.id = label_id
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position.x = wx
+            marker.pose.position.y = wy
+            marker.pose.position.z = 0.5
+            marker.scale.x = 0.3
+            marker.scale.y = 0.3
+            marker.scale.z = 0.3
+            marker.color.r = 1.0
+            marker.color.g = 0.5
+            marker.color.b = 0.0
+            marker.color.a = 0.8
+            marker.lifetime.sec = 2
+            marker_array.markers.append(marker)
+
+        if marker_array.markers:
+            self.marker_pub.publish(marker_array)
+
+    # =====================================================================
+    # Grid ↔ World conversion (using map_info)
+    # =====================================================================
+    def _grid_to_world(self, col: float, row: float):
+        """Convert grid indices to world coordinates."""
+        if self.map_info is None:
+            return 0.0, 0.0
+
+        res = self.map_info.resolution
+        ox = self.map_info.pose.position.x - self.map_info.length_x / 2.0
+        oy = self.map_info.pose.position.y - self.map_info.length_y / 2.0
+
+        wx = col * res + ox + res / 2.0
+        wy = row * res + oy + res / 2.0
+        return float(wx), float(wy)
+
+    # =====================================================================
+    # Enable planner — call SetBool service on Node 3
+    # =====================================================================
+    def _enable_planner(self):
+        """Send a SetBool(True) request to /enable_planner on Node 3."""
+        if not self.enable_client.service_is_ready():
+            self.get_logger().warn(
+                'Service /enable_planner not available, retrying in 2s...'
+            )
+            # One-shot retry timer (stored to prevent accumulation)
+            if hasattr(self, '_retry_timer') and self._retry_timer is not None:
+                self._retry_timer.cancel()
+            self._retry_timer = self.create_timer(2.0, self._enable_planner_retry)
+            return
+
+        request = SetBool.Request()
+        request.data = True
+        future = self.enable_client.call_async(request)
+        future.add_done_callback(self._enable_callback)
+
+    def _enable_planner_retry(self):
+        """Retry enabling the planner (one-shot: cancels its own timer)."""
+        if hasattr(self, '_retry_timer') and self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
+        self._enable_planner()
+
+    def _enable_callback(self, future):
+        try:
+            result = future.result()
+            if result.success:
+                self.planner_enabled = True
+                self.get_logger().info(
+                    f'Planner enabled successfully: {result.message}'
+                )
+            else:
+                self.get_logger().error(
+                    f'Failed to enable planner: {result.message}'
+                )
+        except Exception as e:
+            self.get_logger().error(f'Enable planner service call failed: {e}')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ExplorationManagerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

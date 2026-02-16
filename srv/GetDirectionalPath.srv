@@ -1,0 +1,10 @@
+# GetDirectionalPath.srv
+# Request a directional path from the planner.
+# The planner uses an oriented A* algorithm that penalizes wrong-way traversal
+# via the dot-product of the movement vector with the legal direction layer.
+
+geometry_msgs/PoseStamped goal
+---
+nav_msgs/Path path
+bool success
+string message
