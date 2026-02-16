@@ -38,6 +38,7 @@ import tf2_ros
 from tf2_ros import Buffer, TransformListener
 
 MIN_MORPH_KERNEL = 3
+NON_FREE_CELL_COLOR = (40, 40, 40)
 
 
 class MapProcessorNode(Node):
@@ -194,11 +195,10 @@ class MapProcessorNode(Node):
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
                 free_u8 = (result == 0.0).astype(np.uint8) * 255
                 free_closed = cv2.morphologyEx(free_u8, cv2.MORPH_CLOSE, kernel)
-                closed_result = np.where(free_closed > 0, 0.0, 1.0).astype(np.float32)
-                known_mask = sub >= 0
-                occupied_mask = sub >= self.wall_threshold
-                result[known_mask] = closed_result[known_mask]
-                result[occupied_mask] = 1.0
+                free_cells_mask = (sub >= 0) & (sub < self.wall_threshold)
+                result[free_cells_mask] = np.where(
+                    free_closed[free_cells_mask] > 0, 0.0, result[free_cells_mask]
+                )
 
             with self.lock:
                 self.occupancy[np.ix_(dst_r, dst_c)] = result
@@ -361,7 +361,7 @@ class MapProcessorNode(Node):
 
             # 2) OccupancyGrid — uncertainty
             self._pub_unc(stamp, occ, unc)
-            self._show_uncertainty_debug(occ, unc)
+            self._show_uncertainty_window(occ, unc)
 
             # 3) GridMap — full multi-layer
             self._pub_gridmap(stamp, occ, hits, unc, dx, dy)
@@ -428,7 +428,7 @@ class MapProcessorNode(Node):
         msg.data = grid.tolist()
         self.unc_pub.publish(msg)
 
-    def _show_uncertainty_debug(self, occ, unc):
+    def _show_uncertainty_window(self, occ, unc):
         if not self.show_uncertainty_window:
             return
         try:
@@ -437,7 +437,7 @@ class MapProcessorNode(Node):
             vis[free] = np.clip(unc[free], 0.0, 1.0)
             heat_u8 = (vis * 255.0).astype(np.uint8)
             heat_bgr = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
-            heat_bgr[~free] = (40, 40, 40)
+            heat_bgr[~free] = NON_FREE_CELL_COLOR
             cv2.imshow('qcar2_planner_uncertainty', heat_bgr)
             cv2.waitKey(1)
         except Exception as e:
