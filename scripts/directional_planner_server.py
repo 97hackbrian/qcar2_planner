@@ -71,7 +71,8 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('safety_margin_cells', 2)
         self.declare_parameter('publish_path_markers', True)
         self.declare_parameter('map_frame', 'map')
-        self.declare_parameter('base_frame', 'base_link')
+        # Requirement alignment: planner pose source is odom TF.
+        self.declare_parameter('base_frame', 'odom')
 
         # ── Read parameters ─────────────────────────────────────────────────
         self.direction_penalty = self.get_parameter('direction_penalty').value

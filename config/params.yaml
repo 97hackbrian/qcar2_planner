@@ -31,6 +31,8 @@ map_processor_node:
 
     # --- Publishing ---
     publish_rate: 20.0 # Hz
+    morph_close_kernel_size: 3
+    show_uncertainty_window: true
 
     # --- RViz2 Output Topics ---
     occupancy_out_topic: "/planner_occupancy"
