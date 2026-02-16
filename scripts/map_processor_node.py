@@ -23,6 +23,7 @@ import math
 import traceback
 import numpy as np
 import threading
+import cv2
 
 import rclpy
 from rclpy.node import Node
@@ -59,6 +60,8 @@ class MapProcessorNode(Node):
         self.declare_parameter('hits_threshold', 10)
         self.declare_parameter('publish_rate', 2.0)
         self.declare_parameter('wall_occupy_threshold', 50)
+        self.declare_parameter('morph_close_kernel_size', 3)
+        self.declare_parameter('show_uncertainty_window', True)
         self.declare_parameter('occupancy_out_topic', '/planner_occupancy')
         self.declare_parameter('uncertainty_out_topic', '/planner_uncertainty')
 
@@ -76,6 +79,10 @@ class MapProcessorNode(Node):
         self.hits_threshold = int(self.get_parameter('hits_threshold').value)
         self.publish_rate = float(self.get_parameter('publish_rate').value)
         self.wall_threshold = int(self.get_parameter('wall_occupy_threshold').value)
+        self.morph_kernel = int(self.get_parameter('morph_close_kernel_size').value)
+        self.show_uncertainty_window = bool(
+            self.get_parameter('show_uncertainty_window').value
+        )
         occ_out = str(self.get_parameter('occupancy_out_topic').value)
         unc_out = str(self.get_parameter('uncertainty_out_topic').value)
 
@@ -180,6 +187,12 @@ class MapProcessorNode(Node):
             result = np.full(sub.shape, -1.0, dtype=np.float32)
             result[(sub >= 0) & (sub < self.wall_threshold)] = 0.0
             result[sub >= self.wall_threshold] = 1.0
+            if self.morph_kernel >= 3:
+                k = self.morph_kernel if self.morph_kernel % 2 == 1 else self.morph_kernel + 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                free_u8 = (result == 0.0).astype(np.uint8) * 255
+                free_closed = cv2.morphologyEx(free_u8, cv2.MORPH_CLOSE, kernel)
+                result[sub >= 0] = np.where(free_closed > 0, 0.0, 1.0)[sub >= 0]
 
             with self.lock:
                 self.occupancy[np.ix_(dst_r, dst_c)] = result
@@ -342,6 +355,7 @@ class MapProcessorNode(Node):
 
             # 2) OccupancyGrid — uncertainty
             self._pub_unc(stamp, occ, unc)
+            self._show_uncertainty_debug(occ, unc)
 
             # 3) GridMap — full multi-layer
             self._pub_gridmap(stamp, occ, hits, unc, dx, dy)
@@ -408,6 +422,25 @@ class MapProcessorNode(Node):
         msg.data = grid.tolist()
         self.unc_pub.publish(msg)
 
+    def _show_uncertainty_debug(self, occ, unc):
+        if not self.show_uncertainty_window:
+            return
+        try:
+            vis = np.full_like(unc, 0.0, dtype=np.float32)
+            free = occ == 0.0
+            vis[free] = np.clip(unc[free], 0.0, 1.0)
+            heat_u8 = (vis * 255.0).astype(np.uint8)
+            heat_bgr = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
+            heat_bgr[~free] = (40, 40, 40)
+            cv2.imshow('qcar2_planner_uncertainty', heat_bgr)
+            cv2.waitKey(1)
+        except Exception as e:
+            self.get_logger().warn(
+                f'Uncertainty window disabled: {e}',
+                throttle_duration_sec=5.0
+            )
+            self.show_uncertainty_window = False
+
     # ── GridMap publisher ───────────────────────────────────────────────
     def _pub_gridmap(self, stamp, occ, hits, unc, dx, dy):
         msg = GridMapMsg()
@@ -466,6 +499,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 
