@@ -26,7 +26,7 @@ import rclpy
 from rclpy.node import Node
 
 from grid_map_msgs.msg import GridMap as GridMapMsg
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose, PoseStamped, PoseArray
 from visualization_msgs.msg import Marker, MarkerArray
 from std_srvs.srv import SetBool
 
@@ -75,6 +75,9 @@ class ExplorationManagerNode(Node):
         # ── Publishers ──────────────────────────────────────────────────────
         self.goal_pub = self.create_publisher(
             PoseStamped, '/exploration_goal', 10
+        )
+        self.all_goals_pub = self.create_publisher(
+            PoseArray, '/exploration_goals', 10
         )
         self.marker_pub = self.create_publisher(
             MarkerArray, '/frontier_markers', 10
@@ -247,8 +250,10 @@ class ExplorationManagerNode(Node):
           1. Compute gradient magnitude of the uncertainty layer
           2. Threshold to get frontier cells
           3. Cluster frontier cells (connected components)
-          4. Publish PoseStamped at the centroid of each cluster
-          5. Visualize with MarkerArray
+          4. Sort clusters by size (largest first)
+          5. Publish the largest as primary PoseStamped on /exploration_goal
+          6. Publish ALL frontier centroids as PoseArray on /exploration_goals
+          7. Visualize with MarkerArray
         """
         import cv2
 
@@ -266,38 +271,57 @@ class ExplorationManagerNode(Node):
             frontier_u8, connectivity=8
         )
 
-        marker_array = MarkerArray()
-        goal_published = False
-
+        # Collect valid frontier clusters sorted by size (largest first)
+        clusters = []
         for label_id in range(1, n_labels):  # skip background (0)
             area = stats[label_id, cv2.CC_STAT_AREA]
             if area < self.frontier_min_size:
                 continue
-
-            # Centroid in pixel coordinates → world coordinates
             cx_px, cy_px = centroids[label_id]
             wx, wy = self._grid_to_world(cx_px, cy_px)
+            clusters.append((area, label_id, wx, wy))
 
-            # Publish PoseStamped goal (only the largest/first frontier)
-            if not goal_published:
-                goal = PoseStamped()
-                goal.header.stamp = self.get_clock().now().to_msg()
-                goal.header.frame_id = 'map'
-                goal.pose.position.x = wx
-                goal.pose.position.y = wy
-                goal.pose.position.z = 0.0
-                goal.pose.orientation.w = 1.0
-                self.goal_pub.publish(goal)
-                goal_published = True
+        clusters.sort(key=lambda c: c[0], reverse=True)
 
-                self.get_logger().info(
-                    f'Published frontier goal: ({wx:.2f}, {wy:.2f}), '
-                    f'cluster size={area} cells'
-                )
+        if not clusters:
+            return
 
-            # Visualization marker
+        stamp = self.get_clock().now().to_msg()
+
+        # Publish primary goal (largest frontier)
+        best_area, _, best_wx, best_wy = clusters[0]
+        goal = PoseStamped()
+        goal.header.stamp = stamp
+        goal.header.frame_id = 'map'
+        goal.pose.position.x = best_wx
+        goal.pose.position.y = best_wy
+        goal.pose.position.z = 0.0
+        goal.pose.orientation.w = 1.0
+        self.goal_pub.publish(goal)
+
+        self.get_logger().info(
+            f'Published primary frontier goal: ({best_wx:.2f}, {best_wy:.2f}), '
+            f'cluster size={best_area} cells, total frontiers={len(clusters)}'
+        )
+
+        # Publish ALL frontier centroids as PoseArray
+        all_goals = PoseArray()
+        all_goals.header.stamp = stamp
+        all_goals.header.frame_id = 'map'
+        for _, _, wx, wy in clusters:
+            p = Pose()
+            p.position.x = wx
+            p.position.y = wy
+            p.position.z = 0.0
+            p.orientation.w = 1.0
+            all_goals.poses.append(p)
+        self.all_goals_pub.publish(all_goals)
+
+        # Visualization markers
+        marker_array = MarkerArray()
+        for idx, (area, label_id, wx, wy) in enumerate(clusters):
             marker = Marker()
-            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.stamp = stamp
             marker.header.frame_id = 'map'
             marker.ns = 'frontiers'
             marker.id = label_id
@@ -309,15 +333,20 @@ class ExplorationManagerNode(Node):
             marker.scale.x = 0.3
             marker.scale.y = 0.3
             marker.scale.z = 0.3
-            marker.color.r = 1.0
-            marker.color.g = 0.5
-            marker.color.b = 0.0
+            # Primary frontier is green, others are orange
+            if idx == 0:
+                marker.color.r = 0.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+            else:
+                marker.color.r = 1.0
+                marker.color.g = 0.5
+                marker.color.b = 0.0
             marker.color.a = 0.8
             marker.lifetime.sec = 2
             marker_array.markers.append(marker)
 
-        if marker_array.markers:
-            self.marker_pub.publish(marker_array)
+        self.marker_pub.publish(marker_array)
 
     # =====================================================================
     # Grid ↔ World conversion (using map_info)

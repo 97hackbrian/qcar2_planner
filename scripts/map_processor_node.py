@@ -48,7 +48,7 @@ class MapProcessorNode(Node):
         self.declare_parameter('mesh_marker_topic', '/nvblox_node/mesh_marker')
         self.declare_parameter('occupancy_grid_topic', '/map')
         self.declare_parameter('map_frame', 'map')
-        self.declare_parameter('base_frame', 'odom')
+        self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('map_resolution', 0.05)
         self.declare_parameter('map_size_x', 20.0)
         self.declare_parameter('map_size_y', 20.0)

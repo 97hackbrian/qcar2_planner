@@ -13,7 +13,7 @@ map_processor_node:
 
     # --- TF Frames ---
     map_frame: "map"
-    base_frame: "odom"
+    base_frame: "base_link"
 
     # --- Grid Dimensions ---
     map_resolution: 0.05 # meters per cell
@@ -52,13 +52,13 @@ exploration_manager_node:
     gradient_threshold: 0.3
 
     # --- Publishing ---
-    publish_rate: 20.0
+    publish_rate: 1.0  # Hz (frontier evaluation rate)
 
 directional_planner_server:
   ros__parameters:
     # --- TF Frames ---
     map_frame: "map"
-    base_frame: "odom"
+    base_frame: "base_link"
 
     # --- Planner ---
     direction_penalty: 1.0e6
