@@ -23,16 +23,20 @@ map_processor_node:
     map_origin_y: 0.0 # center in world y
 
     # --- Mesh Z-Filter ---
-    z_min: -0.5
+    z_min: -0.8
     z_max: 2.0
 
     # --- Uncertainty Model ---
     hits_threshold: 10 # nvblox hits for full certainty
+    max_hits_per_cell: 1000.0
 
     # --- Publishing ---
-    publish_rate: 20.0 # Hz
+    publish_rate: 18.0 # legacy (kept for backward compatibility)
+    publish_rate_uncertainty: 18.0 # Hz (realtime frontier update)
+    publish_rate_gridmap: 16.0 # Hz (lower than uncertainty to save CPU)
 
     # --- RViz2 Output Topics ---
+    publish_planner_occupancy: false # /planner_occupancy duplicates /map
     occupancy_out_topic: "/planner_occupancy"
     uncertainty_out_topic: "/planner_uncertainty"
 
@@ -48,8 +52,58 @@ exploration_manager_node:
     work_area_y_max: 10.0
 
     # --- Frontier Detection ---
-    frontier_min_size: 5
-    gradient_threshold: 0.3
+    frontier_min_size: 3                   # ↓ from 5: capture smaller openings
+    certainty_threshold: 0.30              # ↓ from 0.35: tighter discovered boundary
+    mapping_completion_threshold: 0.95
+    frontier_unknown_dilate_cells: 0
+    frontier_clearance_cells: 1
+    frontier_connectivity: 8
+    frontier_uncertainty_threshold: 0.55   # ↓ from 0.60: detect frontiers earlier
+    frontier_fallback_to_map_unknown: true  # ↑ enable fallback when uncertainty front empty
+    reachable_inflation_cells: 1
+    interest_radius_cells: 14              # ↑ from 12: wider sector scan
+    min_unknown_sectors: 1
+    max_interest_points: 16                # ↑ from 12: keep more candidates
+    goal_republish_distance: 0.5           # ↓ from 0.6: faster re-target
+    goal_republish_period_sec: 0.8         # ↓ from 1.0: more responsive
+    goal_switch_margin_m: 0.5              # ↓ from 0.6: allow switching sooner
+    local_frontier_radius_m: 5.0           # ↑ from 3.0: wider reach for gap points
+    center_attractor_weight: 0.50          # ↑ from 0.35: stronger pull to center
+
+    # --- Penetration / Ingress Detection ---
+    enable_penetration_points: true
+    penetration_ray_count: 72              # rays from centroid (every 5°)
+    penetration_ray_step_cells: 1
+    penetration_min_free_run: 3            # ↓ from 4: detect narrower corridors
+    penetration_boost_score: 60.0          # ↑ from 50: higher priority
+    min_unknown_blob_cells: 150            # ↓ from 200: trigger on smaller blobs
+
+    # --- Trajectory Road-Mask & Gap Detection ---
+    # Uses /trajectory_node_list and /constraint_list from Cartographer
+    # to identify the perimeter road and detect openings into the center.
+    enable_trajectory_road_mask: true
+    trajectory_topic: "/trajectory_node_list"
+    constraint_topic: "/constraint_list"
+    road_mask_width_cells: 3               # road band thickness (cells each side)
+    road_gap_min_opening_cells: 4          # min gap cluster size
+    road_gap_boost_score: 80.0             # highest priority: road openings
+
+    # --- Persistent Point Bank & Reveal Radius ---
+    # All detected interest points are stored permanently and revealed
+    # progressively as the robot passes nearby.
+    reveal_radius_m: 4.0                   # metres around robot that clears pts
+    point_bank_cell_size_m: 0.15           # spatial dedup grid resolution
+    point_bank_max_size: 2000              # max entries before oldest eviction
+
+    # --- Hotspot (entrance) detection ---
+    # Identifies the densest cluster of pending points and highlights it
+    # as the most likely entrance to an unexplored path.
+    hotspot_radius_m: 1.5                  # cluster search radius
+    hotspot_min_points: 3                  # min neighbours to qualify
+
+    # --- Robot TF for nearest frontier selection ---
+    map_frame: "map"
+    base_frame: "odom"
 
     # --- Publishing ---
     publish_rate: 20.0

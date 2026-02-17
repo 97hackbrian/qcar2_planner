@@ -57,8 +57,12 @@ class MapProcessorNode(Node):
         self.declare_parameter('z_min', -0.5)
         self.declare_parameter('z_max', 2.0)
         self.declare_parameter('hits_threshold', 10)
+        self.declare_parameter('max_hits_per_cell', 1000.0)
         self.declare_parameter('publish_rate', 2.0)
+        self.declare_parameter('publish_rate_uncertainty', 15.0)
+        self.declare_parameter('publish_rate_gridmap', 5.0)
         self.declare_parameter('wall_occupy_threshold', 50)
+        self.declare_parameter('publish_planner_occupancy', False)
         self.declare_parameter('occupancy_out_topic', '/planner_occupancy')
         self.declare_parameter('uncertainty_out_topic', '/planner_uncertainty')
 
@@ -74,8 +78,18 @@ class MapProcessorNode(Node):
         self.z_min = float(self.get_parameter('z_min').value)
         self.z_max = float(self.get_parameter('z_max').value)
         self.hits_threshold = int(self.get_parameter('hits_threshold').value)
+        self.max_hits_per_cell = float(self.get_parameter('max_hits_per_cell').value)
         self.publish_rate = float(self.get_parameter('publish_rate').value)
+        self.publish_rate_uncertainty = float(
+            self.get_parameter('publish_rate_uncertainty').value
+        )
+        self.publish_rate_gridmap = float(
+            self.get_parameter('publish_rate_gridmap').value
+        )
         self.wall_threshold = int(self.get_parameter('wall_occupy_threshold').value)
+        self.publish_planner_occupancy = bool(
+            self.get_parameter('publish_planner_occupancy').value
+        )
         occ_out = str(self.get_parameter('occupancy_out_topic').value)
         unc_out = str(self.get_parameter('uncertainty_out_topic').value)
 
@@ -100,6 +114,12 @@ class MapProcessorNode(Node):
         self.lock = threading.Lock()
         self.got_map = False
         self.publish_count = 0
+        self.occ_dirty = True
+        self.unc_dirty = True
+
+        # Reusable output buffers (reduce allocations each publish)
+        self._occ_grid_buffer = np.full(self.rows * self.cols, -1, dtype=np.int8)
+        self._unc_grid_buffer = np.full(self.rows * self.cols, -1, dtype=np.int8)
 
         # ── TF2 ─────────────────────────────────────────────────────────────
         self.tf_buffer = Buffer()
@@ -129,18 +149,25 @@ class MapProcessorNode(Node):
 
         # ── Publishers ──────────────────────────────────────────────────────
         self.gridmap_pub = self.create_publisher(GridMapMsg, '/grid_map', 10)
-        self.occ_pub = self.create_publisher(OccupancyGrid, occ_out, 10)
+        self.occ_pub = None
+        if self.publish_planner_occupancy:
+            self.occ_pub = self.create_publisher(OccupancyGrid, occ_out, 10)
         self.unc_pub = self.create_publisher(OccupancyGrid, unc_out, 10)
         self.get_logger().info(
-            f'Publishers: /grid_map, {occ_out}, {unc_out}'
+            f'Publishers: /grid_map, '
+            f'{occ_out if self.publish_planner_occupancy else "(disabled /planner_occupancy)"}, '
+            f'{unc_out}'
         )
 
         # ── Timers ──────────────────────────────────────────────────────────
-        period = 1.0 / max(0.1, self.publish_rate)
-        self.pub_timer = self.create_timer(period, self.publish_all)
+        unc_period = 1.0 / max(0.1, self.publish_rate_uncertainty)
+        grid_period = 1.0 / max(0.1, self.publish_rate_gridmap)
+        self.unc_timer = self.create_timer(unc_period, self.publish_uncertainty_and_optional_occupancy)
+        self.grid_timer = self.create_timer(grid_period, self.publish_gridmap_only)
         self.dir_timer = self.create_timer(0.2, self.record_direction)
         self.get_logger().info(
-            f'Timers: publish every {period:.2f}s, direction every 0.2s'
+            f'Timers: uncertainty every {unc_period:.2f}s, '
+            f'gridmap every {grid_period:.2f}s, direction every 0.2s'
         )
 
         self.get_logger().info('=== MapProcessorNode __init__ DONE ===')
@@ -183,6 +210,19 @@ class MapProcessorNode(Node):
 
             with self.lock:
                 self.occupancy[np.ix_(dst_r, dst_c)] = result
+                # Update uncertainty only on modified region.
+                sub_hits = self.nvblox_hits[np.ix_(dst_r, dst_c)]
+                sub_unc = np.ones_like(sub_hits, dtype=np.float32)
+                free = result == 0.0
+                if np.any(free):
+                    ratio = np.minimum(
+                        1.0,
+                        sub_hits[free] / max(1.0, float(self.hits_threshold))
+                    )
+                    sub_unc[free] = 1.0 - ratio
+                self.uncertainty[np.ix_(dst_r, dst_c)] = sub_unc
+                self.occ_dirty = True
+                self.unc_dirty = True
 
             self.got_map = True
             n_free = int(np.sum(result == 0.0))
@@ -202,7 +242,7 @@ class MapProcessorNode(Node):
     # =====================================================================
     def mesh_callback(self, msg: MarkerArray):
         try:
-            total = 0
+            total_unique_cells = 0
             with self.lock:
                 for marker in msg.markers:
                     if marker.type not in (Marker.TRIANGLE_LIST, Marker.POINTS):
@@ -250,20 +290,38 @@ class MapProcessorNode(Node):
 
                     # Hits on free cells only
                     free = self.occupancy[rows, cols] == 0.0
-                    np.add.at(self.nvblox_hits, (rows[free], cols[free]), 1.0)
-                    total += int(np.sum(free))
+                    rows_f = rows[free]
+                    cols_f = cols[free]
+                    if len(rows_f) == 0:
+                        continue
 
-                # Recompute uncertainty on free cells
-                ratio = np.minimum(
-                    1.0, self.nvblox_hits / max(1.0, float(self.hits_threshold))
-                )
-                self.uncertainty = np.where(
-                    self.occupancy == 0.0, 1.0 - ratio, 1.0
-                )
+                    # Aggregate duplicated points to update only unique cells.
+                    linear = rows_f * self.cols + cols_f
+                    unique_lin, counts = np.unique(linear, return_counts=True)
+                    u_rows = unique_lin // self.cols
+                    u_cols = unique_lin % self.cols
 
-            if total > 0:
+                    self.nvblox_hits[u_rows, u_cols] += counts.astype(np.float32)
+                    if self.max_hits_per_cell > 0.0:
+                        self.nvblox_hits[u_rows, u_cols] = np.minimum(
+                            self.nvblox_hits[u_rows, u_cols],
+                            self.max_hits_per_cell
+                        )
+
+                    # Incremental uncertainty update on touched free cells only.
+                    ratio = np.minimum(
+                        1.0,
+                        self.nvblox_hits[u_rows, u_cols] /
+                        max(1.0, float(self.hits_threshold))
+                    )
+                    self.uncertainty[u_rows, u_cols] = 1.0 - ratio
+                    total_unique_cells += int(len(unique_lin))
+                if total_unique_cells > 0:
+                    self.unc_dirty = True
+
+            if total_unique_cells > 0:
                 self.get_logger().info(
-                    f'nvblox: {total} hits on free cells',
+                    f'nvblox: updated {total_unique_cells} free cells',
                     throttle_duration_sec=2.0,
                 )
         except Exception as e:
@@ -322,11 +380,41 @@ class MapProcessorNode(Node):
             p_dy[empty] = dy
 
     # =====================================================================
-    # Publish ALL outputs (timer callback)
+    # Publish uncertainty (high-rate) + optional occupancy
     # =====================================================================
-    def publish_all(self):
+    def publish_uncertainty_and_optional_occupancy(self):
         self.publish_count += 1
 
+        try:
+            if not self.unc_dirty and not (self.publish_planner_occupancy and self.occ_dirty):
+                return
+
+            with self.lock:
+                occ = self.occupancy.copy()
+                unc = self.uncertainty.copy()
+                publish_occ_now = self.publish_planner_occupancy and self.occ_dirty
+                self.unc_dirty = False
+                if publish_occ_now:
+                    self.occ_dirty = False
+
+            stamp = self.get_clock().now().to_msg()
+
+            # 1) Optional OccupancyGrid — occupancy
+            if publish_occ_now and self.occ_pub is not None:
+                self._pub_occ(stamp, occ)
+
+            # 2) OccupancyGrid — uncertainty (primary realtime output)
+            self._pub_unc(stamp, occ, unc)
+
+        except Exception as e:
+            self.get_logger().error(
+                f'publish_uncertainty_and_optional_occupancy ERROR: {e}\n{traceback.format_exc()}'
+            )
+
+    # =====================================================================
+    # Publish GridMap (lower-rate)
+    # =====================================================================
+    def publish_gridmap_only(self):
         try:
             with self.lock:
                 occ = self.occupancy.copy()
@@ -336,12 +424,6 @@ class MapProcessorNode(Node):
                 dy = self.dir_y.copy()
 
             stamp = self.get_clock().now().to_msg()
-
-            # 1) OccupancyGrid — occupancy
-            self._pub_occ(stamp, occ)
-
-            # 2) OccupancyGrid — uncertainty
-            self._pub_unc(stamp, occ, unc)
 
             # 3) GridMap — full multi-layer
             self._pub_gridmap(stamp, occ, hits, unc, dx, dy)
@@ -357,7 +439,7 @@ class MapProcessorNode(Node):
 
         except Exception as e:
             self.get_logger().error(
-                f'publish_all ERROR: {e}\n{traceback.format_exc()}'
+                f'publish_gridmap_only ERROR: {e}\n{traceback.format_exc()}'
             )
 
     # ── OccupancyGrid publishers ────────────────────────────────────────
@@ -376,12 +458,14 @@ class MapProcessorNode(Node):
         msg.info.origin.orientation.z = 0.0
         msg.info.origin.orientation.w = 1.0
 
-        grid = np.full(self.rows * self.cols, -1, dtype=np.int8)
+        grid = self._occ_grid_buffer
+        grid.fill(-1)
         flat_occ = occ.ravel()
         grid[flat_occ == 0.0] = 0
         grid[flat_occ == 1.0] = 100
         msg.data = grid.tolist()
-        self.occ_pub.publish(msg)
+        if self.occ_pub is not None:
+            self.occ_pub.publish(msg)
 
     def _pub_unc(self, stamp, occ, unc):
         msg = OccupancyGrid()
@@ -400,7 +484,8 @@ class MapProcessorNode(Node):
 
         flat_occ = occ.ravel()
         flat_unc = unc.ravel()
-        grid = np.full(self.rows * self.cols, -1, dtype=np.int8)
+        grid = self._unc_grid_buffer
+        grid.fill(-1)
         free_mask = flat_occ == 0.0
         grid[free_mask] = np.clip(flat_unc[free_mask] * 100.0, 0, 100).astype(
             np.int8
