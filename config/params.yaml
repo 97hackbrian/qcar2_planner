@@ -39,7 +39,7 @@ map_processor_node:
 exploration_manager_node:
   ros__parameters:
     # --- Uncertainty Threshold ---
-    uncertainty_threshold: 0.15
+    uncertainty_threshold: 0.291
 
     # --- Working Area ---
     work_area_x_min: -10.0
