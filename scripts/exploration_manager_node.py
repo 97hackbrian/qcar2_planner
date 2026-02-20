@@ -20,6 +20,7 @@
 # GUARDRAIL: This node does NOT publish any motor commands.
 # =============================================================================
 
+import math
 import numpy as np
 
 import rclpy
@@ -29,6 +30,10 @@ from grid_map_msgs.msg import GridMap as GridMapMsg
 from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_srvs.srv import SetBool
+from std_msgs.msg import Float32
+
+import tf2_ros
+from tf2_ros import Buffer, TransformListener
 
 
 class ExplorationManagerNode(Node):
@@ -50,6 +55,10 @@ class ExplorationManagerNode(Node):
         self.declare_parameter('frontier_min_size', 5)
         self.declare_parameter('gradient_threshold', 0.3)
         self.declare_parameter('publish_rate', 1.0)
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'odom')
+        self.declare_parameter('frontier_fov_deg', 140.0)
+        self.declare_parameter('frontier_max_dist', 5.0)
 
         # ── Read parameters ─────────────────────────────────────────────────
         self.tau = self.get_parameter('uncertainty_threshold').value
@@ -60,12 +69,20 @@ class ExplorationManagerNode(Node):
         self.frontier_min_size = self.get_parameter('frontier_min_size').value
         self.gradient_threshold = self.get_parameter('gradient_threshold').value
         self.publish_rate = self.get_parameter('publish_rate').value
+        self.map_frame = self.get_parameter('map_frame').value
+        self.base_frame = self.get_parameter('base_frame').value
+        self.frontier_fov_deg = self.get_parameter('frontier_fov_deg').value
+        self.frontier_max_dist = self.get_parameter('frontier_max_dist').value
 
         # ── State ───────────────────────────────────────────────────────────
         self.state = self.STATE_MAPPING
         self.latest_gridmap = None
         self.map_info = None
         self.planner_enabled = False
+
+        # ── TF2 ─────────────────────────────────────────────────────────────
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ── Subscribers ─────────────────────────────────────────────────────
         self.gridmap_sub = self.create_subscription(
@@ -78,6 +95,9 @@ class ExplorationManagerNode(Node):
         )
         self.marker_pub = self.create_publisher(
             MarkerArray, '/frontier_markers', 10
+        )
+        self.uncertainty_pub = self.create_publisher(
+            Float32, '/exploration_uncertainty', 10
         )
 
         # ── Service client for enabling the planner (Node 3) ────────────────
@@ -182,6 +202,11 @@ class ExplorationManagerNode(Node):
         u_bar = float(np.mean(u_values))
         mapped_pct = float(np.mean(u_values < 0.5)) * 100.0
 
+        # ── Publish uncertainty value ────────────────────────────────────
+        unc_msg = Float32()
+        unc_msg.data = u_bar
+        self.uncertainty_pub.publish(unc_msg)
+
         self.get_logger().info(
             f'[{self.state}] Mean uncertainty: {u_bar:.3f} | '
             f'Mapped with certainty: {mapped_pct:.1f}% | '
@@ -190,10 +215,18 @@ class ExplorationManagerNode(Node):
 
         # ── State logic ─────────────────────────────────────────────────
         if self.state == self.STATE_MAPPING:
-            if u_bar > self.tau:
-                # Still mapping — find and publish frontier goals
-                self._publish_frontier_goals(uncertainty, mask)
-            else:
+            # Always detect and publish frontier markers
+            # Only publish exploration goals when mapped certainty ≥ τ (as %)
+            should_publish = mapped_pct >= self.tau * 100.0
+            self.get_logger().info(
+                f'[GATE] mapped_pct={mapped_pct:.1f}% >= tau*100={self.tau*100.0:.1f}% ? '
+                f'publish_goal={should_publish}',
+                throttle_duration_sec=5.0
+            )
+            self._publish_frontier_goals(uncertainty, mask,
+                                         publish_goal=should_publish)
+
+            if u_bar <= self.tau:
                 # Map is complete! Switch to READY
                 self.state = self.STATE_READY
                 self.get_logger().info(
@@ -238,64 +271,87 @@ class ExplorationManagerNode(Node):
     # =====================================================================
     # Frontier detection and goal publication
     # =====================================================================
-    def _publish_frontier_goals(self, uncertainty: np.ndarray, free_mask: np.ndarray):
+    def _publish_frontier_goals(self, uncertainty: np.ndarray, free_mask: np.ndarray,
+                                publish_goal: bool = False):
         """
-        Detect frontiers: cells with HIGH gradient of uncertainty, meaning
-        they are at the boundary between mapped and unmapped areas.
-
-        Steps:
-          1. Compute gradient magnitude of the uncertainty layer
-          2. Threshold to get frontier cells
-          3. Cluster frontier cells (connected components)
-          4. Publish PoseStamped at the centroid of each cluster
-          5. Visualize with MarkerArray
+        Detect frontiers and ALWAYS publish MarkerArray for visualization.
+        Goal selection: pick the CLOSEST frontier within frontier_max_dist,
+        preferring those inside the angular cone. If none in cone, fallback
+        to the closest frontier overall (within max_dist).
         """
         import cv2
 
-        # Gradient magnitude (Sobel)
+        # ── Get robot pose ───────────────────────────────────────────────
+        robot_pose = self._get_robot_pose()
+        half_fov = math.radians(self.frontier_fov_deg / 2.0)
+        max_dist = self.frontier_max_dist
+
+        if robot_pose is None:
+            self.get_logger().warn(
+                f'TF lookup {self.map_frame} → {self.base_frame} failed. '
+                'Publishing goals without angular/distance filter.',
+                throttle_duration_sec=5.0
+            )
+
+        # ── Gradient + frontier detection ───────────────────────────────
         grad_x = cv2.Sobel(uncertainty, cv2.CV_32F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(uncertainty, cv2.CV_32F, 0, 1, ksize=3)
         grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
 
-        # Frontier: high gradient AND free cells in working area
         frontier = (grad_mag > self.gradient_threshold) & free_mask
         frontier_u8 = frontier.astype(np.uint8) * 255
 
-        # Connected components
         n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             frontier_u8, connectivity=8
         )
 
+        # ── Collect candidate frontiers with metadata ────────────────────
+        candidates = []
         marker_array = MarkerArray()
-        goal_published = False
 
-        for label_id in range(1, n_labels):  # skip background (0)
+        self.get_logger().warn(
+            f'[DEBUG] n_labels={n_labels}, frontier_cells={int(np.sum(frontier))}, '
+            f'frontier_min_size={self.frontier_min_size}, publish_goal={publish_goal}, '
+            f'robot_pose={robot_pose is not None}',
+            throttle_duration_sec=5.0
+        )
+
+        for label_id in range(1, n_labels):
             area = stats[label_id, cv2.CC_STAT_AREA]
             if area < self.frontier_min_size:
                 continue
 
-            # Centroid in pixel coordinates → world coordinates
             cx_px, cy_px = centroids[label_id]
             wx, wy = self._grid_to_world(cx_px, cy_px)
 
-            # Publish PoseStamped goal (only the largest/first frontier)
-            if not goal_published:
-                goal = PoseStamped()
-                goal.header.stamp = self.get_clock().now().to_msg()
-                goal.header.frame_id = 'map'
-                goal.pose.position.x = wx
-                goal.pose.position.y = wy
-                goal.pose.position.z = 0.0
-                goal.pose.orientation.w = 1.0
-                self.goal_pub.publish(goal)
-                goal_published = True
+            # Compute distance and angle relative to robot
+            if robot_pose is not None:
+                rx, ry, ryaw = robot_pose
+                dist = math.sqrt((wx - rx) ** 2 + (wy - ry) ** 2)
+                angle_to = math.atan2(wy - ry, wx - rx)
+                angle_diff = (angle_to - ryaw + math.pi) % (2.0 * math.pi) - math.pi
+                in_cone = abs(angle_diff) <= half_fov
+                within_dist = dist <= max_dist
+            else:
+                dist = 0.0
+                angle_diff = 0.0
+                in_cone = True
+                within_dist = True
 
-                self.get_logger().info(
-                    f'Published frontier goal: ({wx:.2f}, {wy:.2f}), '
-                    f'cluster size={area} cells'
-                )
+            candidates.append({
+                'wx': wx, 'wy': wy, 'dist': dist,
+                'angle_diff': angle_diff, 'in_cone': in_cone,
+                'within_dist': within_dist, 'area': area, 'label_id': label_id
+            })
 
-            # Visualization marker
+            # Log EVERY candidate (no throttle)
+            self.get_logger().warn(
+                f'[CAND] id={label_id} pos=({wx:.2f},{wy:.2f}) '
+                f'dist={dist:.2f}m angle={math.degrees(angle_diff):.1f}° '
+                f'in_cone={in_cone} within_dist={within_dist} area={area}'
+            )
+
+            # ── ALWAYS add visualization marker ───────────────────────────
             marker = Marker()
             marker.header.stamp = self.get_clock().now().to_msg()
             marker.header.frame_id = 'map'
@@ -309,15 +365,91 @@ class ExplorationManagerNode(Node):
             marker.scale.x = 0.3
             marker.scale.y = 0.3
             marker.scale.z = 0.3
-            marker.color.r = 1.0
-            marker.color.g = 0.5
-            marker.color.b = 0.0
+            # Green = in cone + within dist, Yellow = in cone but far,
+            # Red = outside cone
+            if in_cone and within_dist:
+                marker.color.r = 0.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+            elif in_cone:
+                marker.color.r = 1.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+            else:
+                marker.color.r = 1.0
+                marker.color.g = 0.2
+                marker.color.b = 0.0
             marker.color.a = 0.8
             marker.lifetime.sec = 2
             marker_array.markers.append(marker)
 
+        # ── Publish markers (always) ───────────────────────────────────
         if marker_array.markers:
             self.marker_pub.publish(marker_array)
+
+        # ── Select best goal ──────────────────────────────────────────
+        goal_published = False
+        if publish_goal and candidates:
+            # Priority 1: closest frontier IN cone AND within max_dist
+            in_cone_near = [c for c in candidates if c['in_cone'] and c['within_dist']]
+            # Priority 2: closest frontier within max_dist (any angle)
+            any_near = [c for c in candidates if c['within_dist']]
+            # Priority 3: closest frontier overall
+            chosen_list = in_cone_near or any_near or candidates
+
+            self.get_logger().warn(
+                f'[GOAL] in_cone_near={len(in_cone_near)}, '
+                f'any_near={len(any_near)}, total={len(candidates)}, '
+                f'choosing from {len(chosen_list)}'
+            )
+
+            # Sort by distance → pick closest
+            chosen_list.sort(key=lambda c: c['dist'])
+            best = chosen_list[0]
+
+            goal = PoseStamped()
+            goal.header.stamp = self.get_clock().now().to_msg()
+            goal.header.frame_id = 'map'
+            goal.pose.position.x = best['wx']
+            goal.pose.position.y = best['wy']
+            goal.pose.position.z = 0.0
+            goal.pose.orientation.w = 1.0
+            self.goal_pub.publish(goal)
+            goal_published = True
+
+            self.get_logger().warn(
+                f'[PUBLISHED] goal=({best["wx"]:.2f}, {best["wy"]:.2f}), '
+                f'dist={best["dist"]:.2f}m, '
+                f'angle={math.degrees(best["angle_diff"]):.1f}°, '
+                f'in_cone={best["in_cone"]}'
+            )
+        elif publish_goal:
+            self.get_logger().warn('[GOAL] publish_goal=True but NO candidates!')
+        else:
+            self.get_logger().warn(
+                f'[GOAL] publish_goal=False, skipping. candidates={len(candidates)}',
+                throttle_duration_sec=5.0
+            )
+
+    # =====================================================================
+    # Robot pose from TF (map → odom)
+    # =====================================================================
+    def _get_robot_pose(self):
+        """Get robot (x, y, yaw) in map frame via TF lookup."""
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, rclpy.time.Time()
+            )
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            q = t.transform.rotation
+            yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y ** 2 + q.z ** 2),
+            )
+            return x, y, yaw
+        except Exception:
+            return None
 
     # =====================================================================
     # Grid ↔ World conversion (using map_info)

@@ -39,7 +39,7 @@ map_processor_node:
 exploration_manager_node:
   ros__parameters:
     # --- Uncertainty Threshold ---
-    uncertainty_threshold: 0.291
+    uncertainty_threshold: 0.19
 
     # --- Working Area ---
     work_area_x_min: -10.0
@@ -47,9 +47,17 @@ exploration_manager_node:
     work_area_y_min: -10.0
     work_area_y_max: 10.0
 
+    # --- TF Frames ---
+    map_frame: "map"
+    base_frame: "base_link"
+
     # --- Frontier Detection ---
     frontier_min_size: 5
     gradient_threshold: 0.3
+
+    # --- Frontier Angular Filter ---
+    frontier_fov_deg: 150.0 # total cone width (±85° from heading)
+    frontier_max_dist: 4.0 # max distance (m) from robot to goal
 
     # --- Publishing ---
     publish_rate: 20.0
