@@ -62,6 +62,8 @@ class ExplorationManagerNode(Node):
         self.declare_parameter('spline_n_points', 4)
         self.declare_parameter('spline_wp_tolerance', 0.3)
         self.declare_parameter('spline_curvature', 0.33)
+        self.declare_parameter('frontier_goal_offset_y', 0.0)
+        self.declare_parameter('frontier_goal_offset_x', 0.0)
 
         # ── Read parameters ─────────────────────────────────────────────────
         self.tau = self.get_parameter('uncertainty_threshold').value
@@ -79,6 +81,8 @@ class ExplorationManagerNode(Node):
         self.spline_n_points = self.get_parameter('spline_n_points').value
         self.spline_wp_tolerance = self.get_parameter('spline_wp_tolerance').value
         self.spline_curvature = self.get_parameter('spline_curvature').value
+        self.frontier_goal_offset_y = self.get_parameter('frontier_goal_offset_y').value
+        self.frontier_goal_offset_x = self.get_parameter('frontier_goal_offset_x').value
 
         # ── State ───────────────────────────────────────────────────────────
         self.state = self.STATE_MAPPING
@@ -333,6 +337,8 @@ class ExplorationManagerNode(Node):
 
             cx_px, cy_px = centroids[label_id]
             wx, wy = self._grid_to_world(cx_px, cy_px)
+            wy += self.frontier_goal_offset_y  # offset fijo en Y del mapa
+            wx += self.frontier_goal_offset_x  # offset fijo en X del mapa
 
             # Compute distance and angle relative to robot
             if robot_pose is not None:
