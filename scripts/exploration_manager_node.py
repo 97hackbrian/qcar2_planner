@@ -334,12 +334,14 @@ class ExplorationManagerNode(Node):
                 within_dist = dist <= max_dist
             else:
                 dist = 0.0
+                angle_to = 0.0
                 angle_diff = 0.0
                 in_cone = True
                 within_dist = True
 
             candidates.append({
                 'wx': wx, 'wy': wy, 'dist': dist,
+                'angle_to': angle_to,
                 'angle_diff': angle_diff, 'in_cone': in_cone,
                 'within_dist': within_dist, 'area': area, 'label_id': label_id
             })
@@ -390,39 +392,40 @@ class ExplorationManagerNode(Node):
         # ── Select best goal ──────────────────────────────────────────
         goal_published = False
         if publish_goal and candidates:
-            # Priority 1: closest frontier IN cone AND within max_dist
-            in_cone_near = [c for c in candidates if c['in_cone'] and c['within_dist']]
-            # Priority 2: closest frontier within max_dist (any angle)
-            any_near = [c for c in candidates if c['within_dist']]
-            # Priority 3: closest frontier overall
-            chosen_list = in_cone_near or any_near or candidates
+            # Only consider frontiers that are BOTH in cone AND within max_dist
+            valid = [c for c in candidates if c['in_cone'] and c['within_dist']]
 
             self.get_logger().warn(
-                f'[GOAL] in_cone_near={len(in_cone_near)}, '
-                f'any_near={len(any_near)}, total={len(candidates)}, '
-                f'choosing from {len(chosen_list)}'
+                f'[GOAL] valid={len(valid)} (in_cone+within_dist), '
+                f'total={len(candidates)}'
             )
 
-            # Sort by distance → pick closest
-            chosen_list.sort(key=lambda c: c['dist'])
-            best = chosen_list[0]
+            if not valid:
+                self.get_logger().warn('[GOAL] No frontier meets both angle+distance criteria')
+            else:
+                # Sort by distance → pick closest
+                valid.sort(key=lambda c: c['dist'])
+                best = valid[0]
 
-            goal = PoseStamped()
-            goal.header.stamp = self.get_clock().now().to_msg()
-            goal.header.frame_id = 'map'
-            goal.pose.position.x = best['wx']
-            goal.pose.position.y = best['wy']
-            goal.pose.position.z = 0.0
-            goal.pose.orientation.w = 1.0
-            self.goal_pub.publish(goal)
-            goal_published = True
+                goal = PoseStamped()
+                goal.header.stamp = self.get_clock().now().to_msg()
+                goal.header.frame_id = 'map'
+                goal.pose.position.x = best['wx']
+                goal.pose.position.y = best['wy']
+                goal.pose.position.z = 0.0
+                # Orientation: point from robot toward the goal
+                goal_yaw = best['angle_to']
+                goal.pose.orientation.z = math.sin(goal_yaw / 2.0)
+                goal.pose.orientation.w = math.cos(goal_yaw / 2.0)
+                self.goal_pub.publish(goal)
+                goal_published = True
 
-            self.get_logger().warn(
-                f'[PUBLISHED] goal=({best["wx"]:.2f}, {best["wy"]:.2f}), '
-                f'dist={best["dist"]:.2f}m, '
-                f'angle={math.degrees(best["angle_diff"]):.1f}°, '
-                f'in_cone={best["in_cone"]}'
-            )
+                self.get_logger().warn(
+                    f'[PUBLISHED] goal=({best["wx"]:.2f}, {best["wy"]:.2f}), '
+                    f'dist={best["dist"]:.2f}m, '
+                    f'angle={math.degrees(best["angle_diff"]):.1f}°, '
+                    f'in_cone={best["in_cone"]}'
+                )
         elif publish_goal:
             self.get_logger().warn('[GOAL] publish_goal=True but NO candidates!')
         else:
