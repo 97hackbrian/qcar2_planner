@@ -59,6 +59,9 @@ class ExplorationManagerNode(Node):
         self.declare_parameter('base_frame', 'odom')
         self.declare_parameter('frontier_fov_deg', 140.0)
         self.declare_parameter('frontier_max_dist', 5.0)
+        self.declare_parameter('spline_n_points', 4)
+        self.declare_parameter('spline_wp_tolerance', 0.3)
+        self.declare_parameter('spline_curvature', 0.33)
 
         # ── Read parameters ─────────────────────────────────────────────────
         self.tau = self.get_parameter('uncertainty_threshold').value
@@ -73,11 +76,18 @@ class ExplorationManagerNode(Node):
         self.base_frame = self.get_parameter('base_frame').value
         self.frontier_fov_deg = self.get_parameter('frontier_fov_deg').value
         self.frontier_max_dist = self.get_parameter('frontier_max_dist').value
+        self.spline_n_points = self.get_parameter('spline_n_points').value
+        self.spline_wp_tolerance = self.get_parameter('spline_wp_tolerance').value
+        self.spline_curvature = self.get_parameter('spline_curvature').value
 
         # ── State ───────────────────────────────────────────────────────────
         self.state = self.STATE_MAPPING
         self.latest_gridmap = None
         self.map_info = None
+
+        # ── Spline navigation state ─────────────────────────────────────────
+        self.spline_waypoints = []   # list of (x, y, yaw)
+        self.current_wp_idx = 0      # index of current target waypoint
         self.planner_enabled = False
 
         # ── TF2 ─────────────────────────────────────────────────────────────
@@ -215,14 +225,14 @@ class ExplorationManagerNode(Node):
 
         # ── State logic ─────────────────────────────────────────────────
         if self.state == self.STATE_MAPPING:
+            # If navigating along a spline, advance through waypoints
+            if self.spline_waypoints:
+                self._navigate_spline()
+
             # Always detect and publish frontier markers
-            # Only publish exploration goals when mapped certainty ≥ τ (as %)
-            should_publish = mapped_pct >= self.tau * 100.0
-            self.get_logger().info(
-                f'[GATE] mapped_pct={mapped_pct:.1f}% >= tau*100={self.tau*100.0:.1f}% ? '
-                f'publish_goal={should_publish}',
-                throttle_duration_sec=5.0
-            )
+            # Only generate NEW spline goals when mapped certainty ≥ τ (as %)
+            # AND we have no active spline navigation
+            should_publish = (mapped_pct >= self.tau * 100.0) and not self.spline_waypoints
             self._publish_frontier_goals(uncertainty, mask,
                                          publish_goal=should_publish)
 
@@ -407,18 +417,10 @@ class ExplorationManagerNode(Node):
                 valid.sort(key=lambda c: c['dist'])
                 best = valid[0]
 
-                goal = PoseStamped()
-                goal.header.stamp = self.get_clock().now().to_msg()
-                goal.header.frame_id = 'map'
-                goal.pose.position.x = best['wx']
-                goal.pose.position.y = best['wy']
-                goal.pose.position.z = 0.0
-                # Orientation: point from robot toward the goal
-                goal_yaw = best['angle_to']
-                goal.pose.orientation.z = math.sin(goal_yaw / 2.0)
-                goal.pose.orientation.w = math.cos(goal_yaw / 2.0)
-                self.goal_pub.publish(goal)
-                goal_published = True
+                # Generate spline waypoints and start navigation
+                rx, ry, ryaw = robot_pose
+                self._generate_spline(rx, ry, ryaw,
+                                      best['wx'], best['wy'], best['angle_to'])
 
                 self.get_logger().warn(
                     f'[PUBLISHED] goal=({best["wx"]:.2f}, {best["wy"]:.2f}), '
@@ -435,7 +437,152 @@ class ExplorationManagerNode(Node):
             )
 
     # =====================================================================
-    # Robot pose from TF (map → odom)
+    # Spline generation and sequential navigation
+    # =====================================================================
+    def _generate_spline(self, rx, ry, ryaw, gx, gy, gyaw):
+        """
+        Generate a cubic Bézier curve from robot to goal and store waypoints.
+        Publishes the FIRST waypoint as /exploration_goal immediately.
+        """
+        dist = math.sqrt((gx - rx) ** 2 + (gy - ry) ** 2)
+        if dist < 0.01:
+            return
+
+        d = dist * self.spline_curvature
+
+        p0 = np.array([rx, ry])
+        p1 = p0 + d * np.array([math.cos(ryaw), math.sin(ryaw)])
+        p3 = np.array([gx, gy])
+        p2 = p3 - d * np.array([math.cos(gyaw), math.sin(gyaw)])
+
+        waypoints = []
+        for i in range(self.spline_n_points + 1):
+            t = i / float(self.spline_n_points)
+            t1 = 1.0 - t
+
+            pt = (t1**3 * p0 + 3*t1**2*t * p1 +
+                  3*t1*t**2 * p2 + t**3 * p3)
+
+            tangent = (3*t1**2 * (p1 - p0) + 6*t1*t * (p2 - p1) +
+                       3*t**2 * (p3 - p2))
+            yaw = math.atan2(tangent[1], tangent[0])
+
+            waypoints.append((float(pt[0]), float(pt[1]), yaw))
+
+        # Skip first point (robot's current position)
+        self.spline_waypoints = waypoints[1:]
+        self.current_wp_idx = 0
+
+        # Publish first waypoint immediately
+        self._publish_current_waypoint()
+
+        self.get_logger().info(
+            f'Spline generated: {len(self.spline_waypoints)} waypoints '
+            f'to ({gx:.2f}, {gy:.2f})'
+        )
+
+    def _navigate_spline(self):
+        """
+        Check if robot reached current waypoint. If so, advance to next.
+        Publishes spline waypoint markers every cycle.
+        """
+        if not self.spline_waypoints:
+            return
+
+        robot_pose = self._get_robot_pose()
+        if robot_pose is None:
+            return
+
+        rx, ry, _ = robot_pose
+        wx, wy, _ = self.spline_waypoints[self.current_wp_idx]
+
+        dist_to_wp = math.sqrt((wx - rx) ** 2 + (wy - ry) ** 2)
+
+        if dist_to_wp <= self.spline_wp_tolerance:
+            # Reached current waypoint → advance
+            self.current_wp_idx += 1
+
+            if self.current_wp_idx >= len(self.spline_waypoints):
+                # Completed all waypoints
+                self.get_logger().info('Spline navigation complete!')
+                self.spline_waypoints = []
+                self.current_wp_idx = 0
+                return
+
+            self._publish_current_waypoint()
+            self.get_logger().info(
+                f'Waypoint {self.current_wp_idx}/{len(self.spline_waypoints)} '
+                f'dist_to_prev={dist_to_wp:.2f}m'
+            )
+
+        # Publish markers for all spline waypoints
+        self._publish_spline_markers()
+
+    def _publish_current_waypoint(self):
+        """Publish the current spline waypoint as /exploration_goal."""
+        if self.current_wp_idx >= len(self.spline_waypoints):
+            return
+
+        wx, wy, wyaw = self.spline_waypoints[self.current_wp_idx]
+
+        goal = PoseStamped()
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.header.frame_id = 'map'
+        goal.pose.position.x = wx
+        goal.pose.position.y = wy
+        goal.pose.position.z = 0.0
+        goal.pose.orientation.z = math.sin(wyaw / 2.0)
+        goal.pose.orientation.w = math.cos(wyaw / 2.0)
+        self.goal_pub.publish(goal)
+
+    def _publish_spline_markers(self):
+        """Publish all spline waypoints as ARROW markers in /frontier_markers."""
+        marker_array = MarkerArray()
+
+        for i, (wx, wy, wyaw) in enumerate(self.spline_waypoints):
+            marker = Marker()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'map'
+            marker.ns = 'spline'
+            marker.id = 1000 + i
+            marker.type = Marker.ARROW
+            marker.action = Marker.ADD
+            marker.pose.position.x = wx
+            marker.pose.position.y = wy
+            marker.pose.position.z = 0.3
+            marker.pose.orientation.z = math.sin(wyaw / 2.0)
+            marker.pose.orientation.w = math.cos(wyaw / 2.0)
+            marker.scale.x = 0.2   # arrow length
+            marker.scale.y = 0.06  # arrow width
+            marker.scale.z = 0.06  # arrow height
+
+            if i < self.current_wp_idx:
+                # Reached → dim green
+                marker.color.r = 0.3
+                marker.color.g = 0.7
+                marker.color.b = 0.3
+                marker.color.a = 0.4
+            elif i == self.current_wp_idx:
+                # Current target → bright cyan
+                marker.color.r = 0.0
+                marker.color.g = 1.0
+                marker.color.b = 1.0
+                marker.color.a = 1.0
+            else:
+                # Pending → blue
+                marker.color.r = 0.2
+                marker.color.g = 0.4
+                marker.color.b = 1.0
+                marker.color.a = 0.6
+
+            marker.lifetime.sec = 1
+            marker_array.markers.append(marker)
+
+        if marker_array.markers:
+            self.marker_pub.publish(marker_array)
+
+    # =====================================================================
+    # Robot pose from TF (map → base_link)
     # =====================================================================
     def _get_robot_pose(self):
         """Get robot (x, y, yaw) in map frame via TF lookup."""

@@ -57,7 +57,12 @@ exploration_manager_node:
 
     # --- Frontier Angular Filter ---
     frontier_fov_deg: 130.0 # total cone width (±65° from heading)
-    frontier_max_dist: 2.85 # max distance (m) from robot to goal
+    frontier_max_dist: 2.55 # max distance (m) from robot to goal
+
+    # --- Spline Path ---
+    spline_n_points: 5 # number of waypoints in the curved path
+    spline_wp_tolerance: 0.4 # distance (m) to consider waypoint reached
+    spline_curvature: 0.8 # 0.0 = straight, 0.5 = very curved, 1.0 = extreme
 
     # --- Publishing ---
     publish_rate: 20.0
