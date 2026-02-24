@@ -50,6 +50,8 @@ exploration_manager_node:
     # --- TF Frames ---
     map_frame: "map"
     base_frame: "base_link"
+    primary_tf_frame: "base_link"
+    secondary_tf_frame: "odom"
 
     # --- Frontier Detection ---
     frontier_min_size: 5
@@ -67,6 +69,11 @@ exploration_manager_node:
     # --- Goal Offset ---
     frontier_goal_offset_x: 0.8 # fixed offset in map X axis (meters)
     frontier_goal_offset_y: -0.28 # fixed offset in map Y axis (meters)
+
+    # --- Goal Reached Detection ---
+    goal_reached_tolerance: 0.85 # radial tolerance (m) to consider goal reached
+    next_goal_offset_x: -2.0 # offset in X (m) from current frontier to next goal
+    next_goal_offset_y: -1.9 # offset in Y (m) from current frontier to next goal
 
     # --- Publishing ---
     publish_rate: 20.0

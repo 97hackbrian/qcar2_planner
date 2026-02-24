@@ -25,12 +25,15 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 
 from grid_map_msgs.msg import GridMap as GridMapMsg
 from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_srvs.srv import SetBool
 from std_msgs.msg import Float32
+import std_msgs.msg
+from nav2_msgs.action import NavigateToPose
 
 import tf2_ros
 from tf2_ros import Buffer, TransformListener
@@ -64,6 +67,11 @@ class ExplorationManagerNode(Node):
         self.declare_parameter('spline_curvature', 0.33)
         self.declare_parameter('frontier_goal_offset_y', 0.0)
         self.declare_parameter('frontier_goal_offset_x', 0.0)
+        self.declare_parameter('goal_reached_tolerance', 0.2)
+        self.declare_parameter('primary_tf_frame', 'base_link')
+        self.declare_parameter('secondary_tf_frame', 'odom_filtered')
+        self.declare_parameter('next_goal_offset_x', 0.5)
+        self.declare_parameter('next_goal_offset_y', 0.0)
 
         # ── Read parameters ─────────────────────────────────────────────────
         self.tau = self.get_parameter('uncertainty_threshold').value
@@ -83,6 +91,11 @@ class ExplorationManagerNode(Node):
         self.spline_curvature = self.get_parameter('spline_curvature').value
         self.frontier_goal_offset_y = self.get_parameter('frontier_goal_offset_y').value
         self.frontier_goal_offset_x = self.get_parameter('frontier_goal_offset_x').value
+        self.goal_reached_tolerance = self.get_parameter('goal_reached_tolerance').value
+        self.primary_tf_frame = self.get_parameter('primary_tf_frame').value
+        self.secondary_tf_frame = self.get_parameter('secondary_tf_frame').value
+        self.next_goal_offset_x = self.get_parameter('next_goal_offset_x').value
+        self.next_goal_offset_y = self.get_parameter('next_goal_offset_y').value
 
         # ── State ───────────────────────────────────────────────────────────
         self.state = self.STATE_MAPPING
@@ -93,6 +106,12 @@ class ExplorationManagerNode(Node):
         self.spline_waypoints = []   # list of (x, y, yaw)
         self.current_wp_idx = 0      # index of current target waypoint
         self.planner_enabled = False
+        
+        # ── Goal tracking state ─────────────────────────────────────────────
+        self.current_frontier_goal = None  # (x, y) of current frontier
+        self.goal_reached = False
+        self.last_published_frontier_id = None  # Track single frontier marker
+        self.nav2_goal_handle = None  # Active Nav2 goal handle for canceling
 
         # ── TF2 ─────────────────────────────────────────────────────────────
         self.tf_buffer = Buffer()
@@ -112,6 +131,14 @@ class ExplorationManagerNode(Node):
         )
         self.uncertainty_pub = self.create_publisher(
             Float32, '/exploration_uncertainty', 10
+        )
+        self.goal_reached_pub = self.create_publisher(
+            std_msgs.msg.Bool, '/its_goal', 10
+        )
+
+        # ── Nav2 action client (for cancel/restart) ─────────────────────────
+        self.nav2_client = ActionClient(
+            self, NavigateToPose, '/navigate_to_pose'
         )
 
         # ── Service client for enabling the planner (Node 3) ────────────────
@@ -288,10 +315,9 @@ class ExplorationManagerNode(Node):
     def _publish_frontier_goals(self, uncertainty: np.ndarray, free_mask: np.ndarray,
                                 publish_goal: bool = False):
         """
-        Detect frontiers and ALWAYS publish MarkerArray for visualization.
+        Detect frontiers and publish ONE BEST frontier marker only.
         Goal selection: pick the CLOSEST frontier within frontier_max_dist,
-        preferring those inside the angular cone. If none in cone, fallback
-        to the closest frontier overall (within max_dist).
+        preferring those inside the angular cone.
         """
         import cv2
 
@@ -319,16 +345,8 @@ class ExplorationManagerNode(Node):
             frontier_u8, connectivity=8
         )
 
-        # ── Collect candidate frontiers with metadata ────────────────────
+        # ── Collect ALL candidate frontiers with metadata ────────────────
         candidates = []
-        marker_array = MarkerArray()
-
-        self.get_logger().warn(
-            f'[DEBUG] n_labels={n_labels}, frontier_cells={int(np.sum(frontier))}, '
-            f'frontier_min_size={self.frontier_min_size}, publish_goal={publish_goal}, '
-            f'robot_pose={robot_pose is not None}',
-            throttle_duration_sec=5.0
-        )
 
         for label_id in range(1, n_labels):
             area = stats[label_id, cv2.CC_STAT_AREA]
@@ -337,8 +355,8 @@ class ExplorationManagerNode(Node):
 
             cx_px, cy_px = centroids[label_id]
             wx, wy = self._grid_to_world(cx_px, cy_px)
-            wy += self.frontier_goal_offset_y  # offset fijo en Y del mapa
-            wx += self.frontier_goal_offset_x  # offset fijo en X del mapa
+            wy += self.frontier_goal_offset_y
+            wx += self.frontier_goal_offset_x
 
             # Compute distance and angle relative to robot
             if robot_pose is not None:
@@ -362,83 +380,93 @@ class ExplorationManagerNode(Node):
                 'within_dist': within_dist, 'area': area, 'label_id': label_id
             })
 
-            # Log EVERY candidate (no throttle)
-            self.get_logger().warn(
-                f'[CAND] id={label_id} pos=({wx:.2f},{wy:.2f}) '
-                f'dist={dist:.2f}m angle={math.degrees(angle_diff):.1f}° '
-                f'in_cone={in_cone} within_dist={within_dist} area={area}'
-            )
+        self.get_logger().warn(
+            f'[DEBUG] n_labels={n_labels}, frontier_cells={int(np.sum(frontier))}, '
+            f'frontier_min_size={self.frontier_min_size}, publish_goal={publish_goal}, '
+            f'robot_pose={robot_pose is not None}, candidates={len(candidates)}',
+            throttle_duration_sec=5.0
+        )
 
-            # ── ALWAYS add visualization marker ───────────────────────────
-            marker = Marker()
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.header.frame_id = 'map'
-            marker.ns = 'frontiers'
-            marker.id = label_id
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position.x = wx
-            marker.pose.position.y = wy
-            marker.pose.position.z = 0.5
-            marker.scale.x = 0.3
-            marker.scale.y = 0.3
-            marker.scale.z = 0.3
-            # Green = in cone + within dist, Yellow = in cone but far,
-            # Red = outside cone
-            if in_cone and within_dist:
-                marker.color.r = 0.0
-                marker.color.g = 1.0
-                marker.color.b = 0.0
-            elif in_cone:
-                marker.color.r = 1.0
-                marker.color.g = 1.0
-                marker.color.b = 0.0
-            else:
-                marker.color.r = 1.0
-                marker.color.g = 0.2
-                marker.color.b = 0.0
-            marker.color.a = 0.8
-            marker.lifetime.sec = 2
-            marker_array.markers.append(marker)
+        # ── Select SINGLE BEST frontier (MUST be in_cone AND within_dist) ──
+        best_frontier = None
+        marker_array = MarkerArray()
 
-        # ── Publish markers (always) ───────────────────────────────────
-        if marker_array.markers:
-            self.marker_pub.publish(marker_array)
-
-        # ── Select best goal ──────────────────────────────────────────
-        goal_published = False
-        if publish_goal and candidates:
-            # Only consider frontiers that are BOTH in cone AND within max_dist
+        if candidates:
+            # STRICT: Only consider frontiers that are BOTH in cone AND within max_dist
             valid = [c for c in candidates if c['in_cone'] and c['within_dist']]
 
             self.get_logger().warn(
                 f'[GOAL] valid={len(valid)} (in_cone+within_dist), '
-                f'total={len(candidates)}'
+                f'total={len(candidates)}',
+                throttle_duration_sec=3.0
             )
 
-            if not valid:
-                self.get_logger().warn('[GOAL] No frontier meets both angle+distance criteria')
-            else:
+            if valid:
                 # Sort by distance → pick closest
                 valid.sort(key=lambda c: c['dist'])
-                best = valid[0]
-
-                # Generate spline waypoints and start navigation
-                rx, ry, ryaw = robot_pose
-                self._generate_spline(rx, ry, ryaw,
-                                      best['wx'], best['wy'], best['angle_to'])
-
+                best_frontier = valid[0]
+            else:
                 self.get_logger().warn(
-                    f'[PUBLISHED] goal=({best["wx"]:.2f}, {best["wy"]:.2f}), '
-                    f'dist={best["dist"]:.2f}m, '
-                    f'angle={math.degrees(best["angle_diff"]):.1f}°, '
-                    f'in_cone={best["in_cone"]}'
+                    '[GOAL] No frontier meets both angle+distance criteria'
                 )
+
+        # ── Publish SINGLE marker for best frontier ──────────────────────
+        if best_frontier is not None:
+            marker = Marker()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'map'
+            marker.ns = 'frontiers'
+            marker.id = best_frontier['label_id']
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position.x = best_frontier['wx']
+            marker.pose.position.y = best_frontier['wy']
+            marker.pose.position.z = 0.5
+            marker.scale.x = 0.3
+            marker.scale.y = 0.3
+            marker.scale.z = 0.3
+            # Green = in cone + within dist (the ONLY valid selection)
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.color.a = 0.8
+            marker.lifetime.sec = 2
+            marker_array.markers.append(marker)
+
+            self.last_published_frontier_id = best_frontier['label_id']
+
+            self.get_logger().warn(
+                f'[BEST_FRONTIER] id={best_frontier["label_id"]} '
+                f'pos=({best_frontier["wx"]:.2f}, {best_frontier["wy"]:.2f}) '
+                f'dist={best_frontier["dist"]:.2f}m '
+                f'angle={math.degrees(best_frontier["angle_diff"]):.1f}° '
+                f'in_cone={best_frontier["in_cone"]}'
+            )
+
+        # ── Publish the single marker ───────────────────────────────────
+        if marker_array.markers:
+            self.marker_pub.publish(marker_array)
+
+        # ── Generate spline and publish exploration_goal ──────────────────
+        # STRICT: only when best_frontier exists (already guaranteed in_cone+within_dist)
+        if publish_goal and best_frontier is not None and robot_pose is not None:
+            rx, ry, ryaw = robot_pose
+            self._generate_spline(rx, ry, ryaw,
+                                  best_frontier['wx'], best_frontier['wy'],
+                                  best_frontier['angle_to'])
+
+            self.current_frontier_goal = (best_frontier['wx'], best_frontier['wy'])
+
+            self.get_logger().warn(
+                f'[PUBLISHED] goal=({best_frontier["wx"]:.2f}, {best_frontier["wy"]:.2f}), '
+                f'dist={best_frontier["dist"]:.2f}m, '
+                f'angle={math.degrees(best_frontier["angle_diff"]):.1f}°'
+            )
         elif publish_goal:
-            self.get_logger().warn('[GOAL] publish_goal=True but NO candidates!')
+            self.get_logger().warn('[GOAL] publish_goal=True but NO valid candidates!')
         else:
             self.get_logger().warn(
-                f'[GOAL] publish_goal=False, skipping. candidates={len(candidates)}',
+                f'[GOAL] publish_goal=False, skipping spline generation',
                 throttle_duration_sec=5.0
             )
 
@@ -491,11 +519,12 @@ class ExplorationManagerNode(Node):
         """
         Check if robot reached current waypoint. If so, advance to next.
         Publishes spline waypoint markers every cycle.
+        Detects when goal is reached within goal_reached_tolerance and publishes /its_goal.
         """
         if not self.spline_waypoints:
             return
 
-        robot_pose = self._get_robot_pose()
+        robot_pose = self._get_robot_pose_safe()
         if robot_pose is None:
             return
 
@@ -503,6 +532,52 @@ class ExplorationManagerNode(Node):
         wx, wy, _ = self.spline_waypoints[self.current_wp_idx]
 
         dist_to_wp = math.sqrt((wx - rx) ** 2 + (wy - ry) ** 2)
+
+        # ── Check if FRONTIER goal is reached within goal_reached_tolerance ──
+        if self.current_frontier_goal is not None:
+            dist_to_frontier = math.sqrt(
+                (self.current_frontier_goal[0] - rx) ** 2 +
+                (self.current_frontier_goal[1] - ry) ** 2
+            )
+        else:
+            dist_to_frontier = float('inf')
+
+        if dist_to_frontier <= self.goal_reached_tolerance and self.current_frontier_goal is not None:
+            # ── GOAL REACHED! ────────────────────────────────────────────
+            # 1. Cancel Nav2 navigation first
+            self._cancel_nav2()
+
+            # 2. Publish /its_goal = True
+            goal_msg = std_msgs.msg.Bool()
+            goal_msg.data = True
+            self.goal_reached_pub.publish(goal_msg)
+            
+            self.get_logger().info(
+                f'🎯 Goal reached within tolerance {self.goal_reached_tolerance}m! '
+                f'Distance: {dist_to_frontier:.3f}m — Nav2 cancelled.'
+            )
+            
+            # 3. Generate next goal at offset from current frontier goal
+            next_gx = self.current_frontier_goal[0] + self.next_goal_offset_x
+            next_gy = self.current_frontier_goal[1] + self.next_goal_offset_y
+            
+            # 4. Generate new spline and send to Nav2
+            robot_pose = self._get_robot_pose_safe()
+            if robot_pose is not None:
+                rx, ry, ryaw = robot_pose
+                angle_to_next = math.atan2(next_gy - ry, next_gx - rx)
+                self._generate_spline(rx, ry, ryaw, next_gx, next_gy, angle_to_next)
+                self.current_frontier_goal = (next_gx, next_gy)
+                
+                # Send the new goal to Nav2
+                self._send_nav2_goal(next_gx, next_gy, angle_to_next)
+                
+                self.get_logger().info(
+                    f'➡️  Next goal generated & sent to Nav2: '
+                    f'({next_gx:.2f}, {next_gy:.2f})'
+                )
+            
+            return
 
         if dist_to_wp <= self.spline_wp_tolerance:
             # Reached current waypoint → advance
@@ -540,6 +615,14 @@ class ExplorationManagerNode(Node):
         goal.pose.orientation.z = math.sin(wyaw / 2.0)
         goal.pose.orientation.w = math.cos(wyaw / 2.0)
         self.goal_pub.publish(goal)
+
+        # Also send to Nav2 if available
+        self._send_nav2_goal(wx, wy, wyaw)
+
+        # New goal sent → not reached yet
+        goal_msg = std_msgs.msg.Bool()
+        goal_msg.data = False
+        self.goal_reached_pub.publish(goal_msg)
 
     def _publish_spline_markers(self):
         """Publish all spline waypoints as ARROW markers in /frontier_markers."""
@@ -588,7 +671,7 @@ class ExplorationManagerNode(Node):
             self.marker_pub.publish(marker_array)
 
     # =====================================================================
-    # Robot pose from TF (map → base_link)
+    # Robot pose from TF (map → base_link or odom_filtered with fallback)
     # =====================================================================
     def _get_robot_pose(self):
         """Get robot (x, y, yaw) in map frame via TF lookup."""
@@ -606,6 +689,108 @@ class ExplorationManagerNode(Node):
             return x, y, yaw
         except Exception:
             return None
+
+    def _get_robot_pose_safe(self):
+        """
+        Get robot (x, y, yaw) from TF with fallback.
+        Tries primary_tf_frame first, then secondary_tf_frame.
+        """
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.map_frame, self.primary_tf_frame, rclpy.time.Time()
+            )
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            q = t.transform.rotation
+            yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y ** 2 + q.z ** 2),
+            )
+            return x, y, yaw
+        except Exception:
+            pass
+        
+        # Fallback to secondary frame
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.map_frame, self.secondary_tf_frame, rclpy.time.Time()
+            )
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            q = t.transform.rotation
+            yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y ** 2 + q.z ** 2),
+            )
+            return x, y, yaw
+        except Exception:
+            return None
+
+    # =====================================================================
+    # Nav2 cancel / send goal helpers
+    # =====================================================================
+    def _cancel_nav2(self):
+        """Cancel the current Nav2 goal if one is active."""
+        if self.nav2_goal_handle is not None:
+            try:
+                self.get_logger().info('Cancelling active Nav2 goal...')
+                cancel_future = self.nav2_goal_handle.cancel_goal_async()
+                cancel_future.add_done_callback(self._nav2_cancel_done)
+            except Exception as e:
+                self.get_logger().warn(f'Nav2 cancel failed: {e}')
+            self.nav2_goal_handle = None
+        else:
+            self.get_logger().debug('No active Nav2 goal to cancel.')
+
+    def _nav2_cancel_done(self, future):
+        """Callback when Nav2 cancel completes."""
+        try:
+            result = future.result()
+            self.get_logger().info(f'Nav2 goal cancelled: {result}')
+        except Exception as e:
+            self.get_logger().warn(f'Nav2 cancel callback error: {e}')
+
+    def _send_nav2_goal(self, wx, wy, yaw):
+        """
+        Send a NavigateToPose goal to Nav2.
+        Stores the goal handle for later cancellation.
+        """
+        if not self.nav2_client.server_is_ready():
+            self.get_logger().warn(
+                'Nav2 action server not ready, skipping nav2 goal.',
+                throttle_duration_sec=5.0
+            )
+            return
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.header.frame_id = self.map_frame
+        goal_msg.pose.pose.position.x = float(wx)
+        goal_msg.pose.pose.position.y = float(wy)
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+        send_future = self.nav2_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(self._nav2_goal_response)
+
+        self.get_logger().info(
+            f'Nav2 goal sent: ({wx:.2f}, {wy:.2f}) yaw={math.degrees(yaw):.1f}°'
+        )
+
+    def _nav2_goal_response(self, future):
+        """Callback when Nav2 accepts/rejects the goal."""
+        try:
+            goal_handle = future.result()
+            if goal_handle.accepted:
+                self.nav2_goal_handle = goal_handle
+                self.get_logger().info('Nav2 goal accepted.')
+            else:
+                self.nav2_goal_handle = None
+                self.get_logger().warn('Nav2 goal REJECTED.')
+        except Exception as e:
+            self.nav2_goal_handle = None
+            self.get_logger().warn(f'Nav2 goal response error: {e}')
 
     # =====================================================================
     # Grid ↔ World conversion (using map_info)
