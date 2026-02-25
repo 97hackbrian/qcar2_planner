@@ -64,16 +64,16 @@ exploration_manager_node:
     # --- Spline Path ---
     spline_n_points: 3 # number of waypoints in the curved path
     spline_wp_tolerance: 0.4 # distance (m) to consider waypoint reached
-    spline_curvature: 0.5 # 0.0 = straight, 0.5 = very curved, 1.0 = extreme
+    spline_curvature: 0.35 # 0.0 = straight, 0.5 = very curved, 1.0 = extreme
 
     # --- Goal Offset ---
     frontier_goal_offset_x: 0.8 # fixed offset in map X axis (meters)
-    frontier_goal_offset_y: -0.28 # fixed offset in map Y axis (meters)
+    frontier_goal_offset_y: -0.3 # fixed offset in map Y axis (meters)
 
     # --- Goal Reached Detection ---
     goal_reached_tolerance: 0.85 # radial tolerance (m) to consider goal reached
     next_goal_offset_x: -2.0 # offset in X (m) from current frontier to next goal
-    next_goal_offset_y: -1.9 # offset in Y (m) from current frontier to next goal
+    next_goal_offset_y: -1.5 # offset in Y (m) from current frontier to next goal
 
     # --- Publishing ---
     publish_rate: 20.0
