@@ -82,7 +82,7 @@ directional_planner_server:
   ros__parameters:
     # --- TF Frames ---
     map_frame: "map"
-    base_frame: "odom"
+    base_frame: "base_link" # robot heading frame (NOT odom!)
 
     # --- Planner ---
     direction_penalty: 1.0e6
@@ -103,6 +103,11 @@ directional_planner_server:
 
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
+
+    # --- Ackermann Constraints ---
+    max_turn_angle_deg: 110.0 # max turn angle (>120° = hard-blocked)
+    right_bias_penalty: 1.5 # penalizes left turns + attracts to right wall
+    forward_lock_cells: 20 # strict 90° forward within this radius (cells from start)
 
 map_loader_node:
   ros__parameters:

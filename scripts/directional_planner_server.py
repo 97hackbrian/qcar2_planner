@@ -87,6 +87,10 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('semi_goal_spacing_m', 1.0)
         self.declare_parameter('semi_goal_tolerance', 0.3)
         self.declare_parameter('auto_enable', False)
+        # Ackermann rules
+        self.declare_parameter('max_turn_angle_deg', 120.0)
+        self.declare_parameter('right_bias_penalty', 0.5)
+        self.declare_parameter('forward_lock_cells', 20)
 
         # ── Read parameters ─────────────────────────────────────────────────
         self.direction_penalty = self.get_parameter('direction_penalty').value
@@ -101,6 +105,16 @@ class DirectionalPlannerServer(Node):
         self.semi_goal_spacing = float(self.get_parameter('semi_goal_spacing_m').value)
         self.semi_goal_tolerance = float(self.get_parameter('semi_goal_tolerance').value)
         auto_enable = bool(self.get_parameter('auto_enable').value)
+        max_turn_deg = float(self.get_parameter('max_turn_angle_deg').value)
+        self.max_turn_cos = math.cos(math.radians(max_turn_deg))  # dot threshold
+        self.right_bias_penalty = float(self.get_parameter('right_bias_penalty').value)
+        self.forward_lock_cells = int(self.get_parameter('forward_lock_cells').value)
+
+        self.get_logger().info(
+            f'Ackermann: max_turn={max_turn_deg}° (cos={self.max_turn_cos:.3f}), '
+            f'right_bias={self.right_bias_penalty}, '
+            f'forward_lock={self.forward_lock_cells} cells'
+        )
 
         # ── State ───────────────────────────────────────────────────────────
         self.enabled = auto_enable  # auto-enable when running in map-loader mode
@@ -267,8 +281,11 @@ class DirectionalPlannerServer(Node):
             return response
 
         # ── Run oriented A* ─────────────────────────────────────────────
+        # Get robot yaw for Ackermann constraints
+        robot_pose = self._get_robot_pose()
+        start_yaw = robot_pose[2] if robot_pose else 0.0
         path_cells = self._astar_directional(
-            start_col, start_row, goal_col, goal_row
+            start_col, start_row, goal_col, goal_row, start_yaw=start_yaw
         )
 
         if path_cells is None:
@@ -324,28 +341,17 @@ class DirectionalPlannerServer(Node):
     # =====================================================================
     # Oriented A* Algorithm
     # =====================================================================
-    def _astar_directional(self, sc, sr, gc, gr):
+    def _astar_directional(self, sc, sr, gc, gr, start_yaw=0.0):
         """
-        A* search on the 2D grid with directional cost penalty.
-
-        The cost to move from cell A=(ac,ar) to cell B=(bc,br) is:
-
-            Cost(A, B) = dist(A, B) + P
-
-        Where P is the dot-product penalty:
-            V_AB = normalize(B - A)       # movement direction
-            L    = (dir_x[A], dir_y[A])   # legal lane direction
-
-            dot  = V_AB · L = Vx*Lx + Vy*Ly
-
-            P = 0                if dot >= 0  (aligned with traffic)
-            P = direction_penalty if dot <  0  (against traffic)
-
-        This blocks wrong-way paths while allowing any forward-aligned movement.
+        A* search with Ackermann constraints:
+          1. No U-turns: penalizes movements backwards relative to incoming dir
+          2. Right-side bias: penalizes left turns to hug the right edge
+          3. Traffic direction penalty (from dir_x/dir_y layers if available)
 
         Args:
             sc, sr: start column, row
             gc, gr: goal column, row
+            start_yaw: robot heading in radians (used for initial direction)
 
         Returns:
             List of (col, row) tuples, or None if no path found.
@@ -354,75 +360,39 @@ class DirectionalPlannerServer(Node):
         dir_x = self.latest_layers.get('dir_x', np.zeros_like(occupancy))
         dir_y = self.latest_layers.get('dir_y', np.zeros_like(occupancy))
 
-        # ── Inflate obstacles for safety ────────────────────────────────
-        # occupancy: -1=unknown, 0=free, 1=wall → ONLY 0 is navigable
-        # Use tolerance for float precision (GridMap serialization round-trip)
+        # ── Distance-to-wall map (for right-edge attraction) ────────────
         import cv2
+        free_mask_bin = (np.abs(occupancy) < 0.1).astype(np.uint8)
+        # Distance from each free cell to the nearest wall
+        dist_to_wall = cv2.distanceTransform(free_mask_bin, cv2.DIST_L2, 5)
+        dist_to_wall = dist_to_wall.astype(np.float32)
+
+        # ── Inflate obstacles for safety ────────────────────────────────
         obstacle_mask = (np.abs(occupancy) > 0.1).astype(np.uint8)
 
         self.get_logger().info(
             f'[A*] Grid {self.grid_cols}x{self.grid_rows}, '
-            f'free_cells={int(np.sum(obstacle_mask == 0))}, '
-            f'blocked_cells={int(np.sum(obstacle_mask > 0))}',
+            f'free={int(np.sum(obstacle_mask == 0))}, '
+            f'blocked={int(np.sum(obstacle_mask > 0))}, '
+            f'start_yaw={math.degrees(start_yaw):.1f}°',
         )
 
         if self.safety_margin > 0:
             k = 2 * self.safety_margin + 1
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
             obstacle_mask = cv2.dilate(obstacle_mask, kernel)
-            self.get_logger().info(
-                f'[A*] After inflation (margin={self.safety_margin}): '
-                f'free={int(np.sum(obstacle_mask == 0))}, '
-                f'blocked={int(np.sum(obstacle_mask > 0))}'
-            )
 
-        # ── Diagnostic: check start & goal in obstacle_mask ─────────────
-        start_blocked = obstacle_mask[sr, sc] > 0
-        goal_blocked = obstacle_mask[gr, gc] > 0
-        self.get_logger().info(
-            f'[A*] start({sc},{sr}) blocked={start_blocked}, '
-            f'goal({gc},{gr}) blocked={goal_blocked}'
-        )
-
-        # Print 5x5 window of obstacle_mask around start
-        r_lo = max(0, sr - 2)
-        r_hi = min(self.grid_rows, sr + 3)
-        c_lo = max(0, sc - 2)
-        c_hi = min(self.grid_cols, sc + 3)
-        window = obstacle_mask[r_lo:r_hi, c_lo:c_hi]
-        self.get_logger().info(
-            f'[A*] obstacle_mask 5x5 around start:\n{window}'
-        )
-        occ_window = occupancy[r_lo:r_hi, c_lo:c_hi]
-        self.get_logger().info(
-            f'[A*] occupancy 5x5 around start:\n{occ_window}'
-        )
-
-        # If start or goal is blocked after inflation, clear a small radius
-        if start_blocked:
-            self.get_logger().warn(
-                '[A*] Start is blocked after inflation! Clearing 3x3 around start.'
-            )
-            sr_lo = max(0, sr - 1)
-            sr_hi = min(self.grid_rows, sr + 2)
-            sc_lo = max(0, sc - 1)
-            sc_hi = min(self.grid_cols, sc + 2)
-            obstacle_mask[sr_lo:sr_hi, sc_lo:sc_hi] = 0
-
-        if goal_blocked:
-            self.get_logger().warn(
-                '[A*] Goal is blocked after inflation! Clearing 3x3 around goal.'
-            )
-            gr_lo = max(0, gr - 1)
-            gr_hi = min(self.grid_rows, gr + 2)
-            gc_lo = max(0, gc - 1)
-            gc_hi = min(self.grid_cols, gc + 2)
-            obstacle_mask[gr_lo:gr_hi, gc_lo:gc_hi] = 0
+        # ── Start/goal blocked check ────────────────────────────────────
+        if obstacle_mask[sr, sc] > 0:
+            self.get_logger().warn('[A*] Start blocked! Clearing 3x3.')
+            obstacle_mask[max(0,sr-1):min(self.grid_rows,sr+2),
+                          max(0,sc-1):min(self.grid_cols,sc+2)] = 0
+        if obstacle_mask[gr, gc] > 0:
+            self.get_logger().warn('[A*] Goal blocked! Clearing 3x3.')
+            obstacle_mask[max(0,gr-1):min(self.grid_rows,gr+2),
+                          max(0,gc-1):min(self.grid_cols,gc+2)] = 0
 
         # ── A* data structures ──────────────────────────────────────────
-        # open_set: priority queue of (f_score, col, row)
-        # g_score: best known cost from start to (col, row)
-        # came_from: backtracking dict
         INF = float('inf')
         g_score = np.full((self.grid_rows, self.grid_cols), INF, dtype=np.float64)
         g_score[sr, sc] = 0.0
@@ -432,11 +402,22 @@ class DirectionalPlannerServer(Node):
         came_from = {}
         closed = set()
 
+        # Robot's original heading
+        fwd_dx = math.cos(start_yaw)
+        fwd_dy = math.sin(start_yaw)
+
+        # Hybrid: strict heading near start, incoming-dir beyond lock radius
+        # incoming_dir tracks per-cell direction for cells far from start
+        incoming_dir = {}
+        incoming_dir[(sc, sr)] = (fwd_dx, fwd_dy)
+        lock_radius_sq = self.forward_lock_cells ** 2
+
         # 8-connected neighbors: (dc, dr, distance)
+        SQRT2 = math.sqrt(2)
         neighbors_8 = [
-            (-1, -1, math.sqrt(2)), (0, -1, 1.0), (1, -1, math.sqrt(2)),
-            (-1,  0, 1.0),                          (1,  0, 1.0),
-            (-1,  1, math.sqrt(2)), (0,  1, 1.0), (1,  1, math.sqrt(2)),
+            (-1, -1, SQRT2), (0, -1, 1.0), (1, -1, SQRT2),
+            (-1,  0, 1.0),                  (1,  0, 1.0),
+            (-1,  1, SQRT2), (0,  1, 1.0), (1,  1, SQRT2),
         ]
 
         iterations = 0
@@ -465,6 +446,24 @@ class DirectionalPlannerServer(Node):
                 continue
             closed.add((cc, cr))
 
+            # Determine which direction to compare against:
+            # Near start → strict robot heading (no going backwards at all)
+            # Far from start → incoming direction (follow road curves)
+            dist_from_start_sq = (cc - sc)**2 + (cr - sr)**2
+            near_start = dist_from_start_sq <= lock_radius_sq
+
+            if near_start:
+                # STRICT: use original robot heading
+                ref_dx, ref_dy = fwd_dx, fwd_dy
+                # Near start: hard 90° limit (never go backwards)
+                turn_threshold = 0.0  # cos(90°) = 0
+            else:
+                # FAR: use incoming direction, allow larger turns for road curves
+                ref_dx, ref_dy = incoming_dir.get(
+                    (cc, cr), (fwd_dx, fwd_dy)
+                )
+                turn_threshold = self.max_turn_cos
+
             for dc, dr, dist in neighbors_8:
                 nc, nr = cc + dc, cr + dr
 
@@ -475,8 +474,7 @@ class DirectionalPlannerServer(Node):
                 if (nc, nr) in closed:
                     continue
 
-                # ── Directional penalty via dot product ─────────────────
-                # Movement vector V_AB from current (cc,cr) to neighbor (nc,nr)
+                # ── Movement direction (normalized) ─────────────────────
                 vx = float(dc)
                 vy = float(dr)
                 v_norm = math.sqrt(vx * vx + vy * vy)
@@ -484,28 +482,40 @@ class DirectionalPlannerServer(Node):
                     vx /= v_norm
                     vy /= v_norm
 
-                # Legal direction L at current cell
+                # ── Rule 1: HARD-BLOCK excessive turns ──────────────────
+                dot_forward = vx * ref_dx + vy * ref_dy
+                if dot_forward < turn_threshold:
+                    continue  # BLOCKED
+
+                penalty = 0.0
+
+                # ── Rule 2: Right-edge attraction ───────────────────────
+                # 2a. Penalize left turns
+                cross = ref_dx * vy - ref_dy * vx
+                if cross > 0.05:
+                    penalty += self.right_bias_penalty
+
+                # 2b. Attract toward walls (prefer being close to wall)
+                d = dist_to_wall[nr, nc]
+                penalty += d * 0.02
+
+                # ── Traffic direction penalty (from map layers) ─────────
                 lx = float(dir_x[cr, cc])
                 ly = float(dir_y[cr, cc])
-
-                # Dot product: V_AB · L = |V||L|cos(θ)
-                # If dot >= 0: aligned with traffic (P = 0)
-                # If dot <  0: against traffic (P = penalty ≈ ∞)
-                penalty = 0.0
                 l_norm = math.sqrt(lx * lx + ly * ly)
-                if l_norm > 0.01:  # Only penalize where direction is known
+                if l_norm > 0.01:
                     dot = vx * lx + vy * ly
                     if dot < 0:
-                        penalty = self.direction_penalty
+                        penalty += self.direction_penalty
 
                 # ── Total edge cost ─────────────────────────────────────
-                # Cost = Euclidean distance (in cells) + direction penalty
                 edge_cost = dist * self.map_info.resolution + penalty
 
                 tentative_g = g_score[cr, cc] + edge_cost
                 if tentative_g < g_score[nr, nc]:
                     g_score[nr, nc] = tentative_g
                     came_from[(nc, nr)] = (cc, cr)
+                    incoming_dir[(nc, nr)] = (vx, vy)
                     f_score = tentative_g + self._heuristic(nc, nr, gc, gr)
                     heapq.heappush(open_set, (f_score, nc, nr))
 
@@ -699,9 +709,11 @@ class DirectionalPlannerServer(Node):
             )
             return
 
-        # Run A*
+        # Run A* with robot yaw for Ackermann constraints
+        start_yaw = robot_pose[2] if robot_pose is not None else 0.0
         path_cells = self._astar_directional(start_col, start_row,
-                                              goal_col, goal_row)
+                                              goal_col, goal_row,
+                                              start_yaw=start_yaw)
         if path_cells is None:
             self.get_logger().error('No path found to goal.')
             return
