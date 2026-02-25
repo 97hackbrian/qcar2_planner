@@ -360,12 +360,21 @@ class DirectionalPlannerServer(Node):
         dir_x = self.latest_layers.get('dir_x', np.zeros_like(occupancy))
         dir_y = self.latest_layers.get('dir_y', np.zeros_like(occupancy))
 
-        # ── Distance-to-wall map (for right-edge attraction) ────────────
+        # ── Distance-to-wall + gradient (for right-edge attraction) ─────
         import cv2
         free_mask_bin = (np.abs(occupancy) < 0.1).astype(np.uint8)
-        # Distance from each free cell to the nearest wall
         dist_to_wall = cv2.distanceTransform(free_mask_bin, cv2.DIST_L2, 5)
         dist_to_wall = dist_to_wall.astype(np.float32)
+        # Gradient of dist_to_wall: points AWAY from nearest wall
+        # grad_col = change in col direction (X), grad_row = change in row direction (Y)
+        grad_row, grad_col = np.gradient(dist_to_wall)
+        # Smooth the gradient to avoid noise
+        grad_col = cv2.GaussianBlur(grad_col, (5, 5), 1.0)
+        grad_row = cv2.GaussianBlur(grad_row, (5, 5), 1.0)
+        # Normalize gradient
+        grad_mag = np.sqrt(grad_col**2 + grad_row**2) + 1e-6
+        grad_col /= grad_mag
+        grad_row /= grad_mag
 
         # ── Inflate obstacles for safety ────────────────────────────────
         obstacle_mask = (np.abs(occupancy) > 0.1).astype(np.uint8)
@@ -489,15 +498,19 @@ class DirectionalPlannerServer(Node):
 
                 penalty = 0.0
 
-                # ── Rule 2: Right-edge attraction ───────────────────────
-                # 2a. Penalize left turns
-                cross = ref_dx * vy - ref_dy * vx
-                if cross > 0.05:
-                    penalty += self.right_bias_penalty
-
-                # 2b. Attract toward walls (prefer being close to wall)
-                d = dist_to_wall[nr, nc]
-                penalty += d * 0.02
+                # ── Rule 2: Right-wall attraction (gradient-based) ──────
+                # Right direction = perpendicular clockwise to movement
+                right_dx = vy    # rotate (vx,vy) 90° clockwise
+                right_dy = -vx
+                # Gradient at neighbor cell (points AWAY from nearest wall)
+                gx = float(grad_col[nr, nc])
+                gy = float(grad_row[nr, nc])
+                # Dot(gradient, right_dir):
+                #   negative → nearest wall is to the RIGHT → good
+                #   positive → nearest wall is to the LEFT  → penalize
+                right_dot = gx * right_dx + gy * right_dy
+                # Scale to [0, 2]: 0 = right wall, 1 = center, 2 = left wall
+                penalty += max(0.0, right_dot + 0.3) * self.right_bias_penalty
 
                 # ── Traffic direction penalty (from map layers) ─────────
                 lx = float(dir_x[cr, cc])

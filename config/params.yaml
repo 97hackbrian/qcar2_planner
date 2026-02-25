@@ -106,7 +106,7 @@ directional_planner_server:
 
     # --- Ackermann Constraints ---
     max_turn_angle_deg: 110.0 # max turn angle (>120° = hard-blocked)
-    right_bias_penalty: 1.5 # penalizes left turns + attracts to right wall
+    right_bias_penalty: 0.5 # gradient-based right wall attraction strength
     forward_lock_cells: 20 # strict 90° forward within this radius (cells from start)
 
 map_loader_node:
