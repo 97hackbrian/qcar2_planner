@@ -87,7 +87,35 @@ directional_planner_server:
     # --- Planner ---
     direction_penalty: 1.0e6
     occupancy_threshold: 0.5
-    safety_margin_cells: 2
+    safety_margin_cells: 0 # 0 for loaded maps (narrow roads get blocked by inflation)
 
     # --- Debug ---
     publish_path_markers: true
+
+    # --- Goal Input (configurable topic) ---
+    goal_input_topic: "/goal_pose"
+
+    # --- Semi-Goal Navigation ---
+    mission_goals_topic: "/mission_goals"
+    semi_goals_markers_topic: "/semi_goals_markers"
+    semi_goal_spacing_m: 1.0
+    semi_goal_tolerance: 0.3
+
+    # --- Auto-enable (set via launch, not here) ---
+    auto_enable: false
+
+map_loader_node:
+  ros__parameters:
+    # --- Map File ---
+    map_yaml_path: "/workspaces/isaac_ros-dev/ros2/utils/mapV4uncertainty.yaml" # set via launch arg
+
+    # --- Morphological Post-Processing ---
+    morph_kernel_size: 3 # kernel for opening + closing
+
+    # --- Publishing ---
+    publish_rate: 1.0
+    map_frame: "map"
+
+    # --- Output Topics ---
+    uncertainty_out_topic: "/planner_uncertainty"
+    gridmap_out_topic: "/grid_map"

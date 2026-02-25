@@ -55,6 +55,14 @@ from std_msgs.msg import ColorRGBA
 import tf2_ros
 from tf2_ros import Buffer, TransformListener
 
+# For semi-goal sequential navigation
+from rclpy.action import ActionClient
+try:
+    from nav2_msgs.action import NavigateToPose
+    HAS_NAV2 = True
+except ImportError:
+    HAS_NAV2 = False
+
 
 class DirectionalPlannerServer(Node):
     """
@@ -72,6 +80,13 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('publish_path_markers', True)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('base_frame', 'base_link')
+        # New: semi-goal and goal input parameters
+        self.declare_parameter('goal_input_topic', '/goal_pose')
+        self.declare_parameter('mission_goals_topic', '/mission_goals')
+        self.declare_parameter('semi_goals_markers_topic', '/semi_goals_markers')
+        self.declare_parameter('semi_goal_spacing_m', 1.0)
+        self.declare_parameter('semi_goal_tolerance', 0.3)
+        self.declare_parameter('auto_enable', False)
 
         # ── Read parameters ─────────────────────────────────────────────────
         self.direction_penalty = self.get_parameter('direction_penalty').value
@@ -80,13 +95,25 @@ class DirectionalPlannerServer(Node):
         self.pub_markers = self.get_parameter('publish_path_markers').value
         self.map_frame = self.get_parameter('map_frame').value
         self.base_frame = self.get_parameter('base_frame').value
+        goal_input_topic = str(self.get_parameter('goal_input_topic').value)
+        mission_goals_topic = str(self.get_parameter('mission_goals_topic').value)
+        semi_markers_topic = str(self.get_parameter('semi_goals_markers_topic').value)
+        self.semi_goal_spacing = float(self.get_parameter('semi_goal_spacing_m').value)
+        self.semi_goal_tolerance = float(self.get_parameter('semi_goal_tolerance').value)
+        auto_enable = bool(self.get_parameter('auto_enable').value)
 
         # ── State ───────────────────────────────────────────────────────────
-        self.enabled = False      # Set to True when map is READY (via SetBool)
-        self.latest_layers = None # dict of layer_name → numpy array
+        self.enabled = auto_enable  # auto-enable when running in map-loader mode
+        self.latest_layers = None   # dict of layer_name → numpy array
         self.map_info = None
         self.grid_rows = 0
         self.grid_cols = 0
+
+        # ── Semi-goal navigation state ──────────────────────────────────────
+        self.semi_goals = []        # list of (x, y, yaw)
+        self.current_sg_idx = 0     # index of current semi-goal
+        self.main_goal = None       # (x, y) of the main goal
+        self.navigating = False     # True when semi-goal navigation is active
 
         # ── TF2 ─────────────────────────────────────────────────────────────
         self.tf_buffer = Buffer()
@@ -96,6 +123,10 @@ class DirectionalPlannerServer(Node):
         self.gridmap_sub = self.create_subscription(
             GridMapMsg, '/grid_map', self.gridmap_callback, 10
         )
+        # Goal input subscriber
+        self.goal_sub = self.create_subscription(
+            PoseStamped, goal_input_topic, self._goal_callback, 10
+        )
 
         # ── Service: /enable_planner (SetBool) ──────────────────────────────
         self.enable_srv = self.create_service(
@@ -103,7 +134,6 @@ class DirectionalPlannerServer(Node):
         )
 
         # ── Service: /get_directional_path (custom srv) ─────────────────────
-        # Import the auto-generated service type
         from qcar2_planner.srv import GetDirectionalPath
         self.plan_srv = self.create_service(
             GetDirectionalPath, '/get_directional_path', self.plan_callback
@@ -114,12 +144,24 @@ class DirectionalPlannerServer(Node):
         self.arrow_pub = self.create_publisher(
             MarkerArray, '/path_arrows', 10
         )
+        # New: semi-goal publishers
+        self.mission_pub = self.create_publisher(
+            PoseStamped, mission_goals_topic, 10
+        )
+        self.sg_marker_pub = self.create_publisher(
+            MarkerArray, semi_markers_topic, 10
+        )
+
+        # ── Semi-goal tracking timer ────────────────────────────────────────
+        self.sg_timer = self.create_timer(0.1, self._semi_goal_tick)
 
         self.get_logger().info(
             'DirectionalPlannerServer initialized. '
             f'Penalty={self.direction_penalty}, '
-            f'occ_thresh={self.occ_threshold}. '
-            'Waiting for /enable_planner...'
+            f'occ_thresh={self.occ_threshold}, '
+            f'auto_enable={auto_enable}. '
+            f'Goal input: {goal_input_topic}, '
+            f'Mission output: {mission_goals_topic}'
         )
 
     # =====================================================================
@@ -313,13 +355,69 @@ class DirectionalPlannerServer(Node):
         dir_y = self.latest_layers.get('dir_y', np.zeros_like(occupancy))
 
         # ── Inflate obstacles for safety ────────────────────────────────
-        # New occupancy: -1=unknown, 0=free, 1=wall → block everything != 0
+        # occupancy: -1=unknown, 0=free, 1=wall → ONLY 0 is navigable
+        # Use tolerance for float precision (GridMap serialization round-trip)
         import cv2
-        obstacle_mask = (occupancy != 0.0).astype(np.uint8)
+        obstacle_mask = (np.abs(occupancy) > 0.1).astype(np.uint8)
+
+        self.get_logger().info(
+            f'[A*] Grid {self.grid_cols}x{self.grid_rows}, '
+            f'free_cells={int(np.sum(obstacle_mask == 0))}, '
+            f'blocked_cells={int(np.sum(obstacle_mask > 0))}',
+        )
+
         if self.safety_margin > 0:
             k = 2 * self.safety_margin + 1
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
             obstacle_mask = cv2.dilate(obstacle_mask, kernel)
+            self.get_logger().info(
+                f'[A*] After inflation (margin={self.safety_margin}): '
+                f'free={int(np.sum(obstacle_mask == 0))}, '
+                f'blocked={int(np.sum(obstacle_mask > 0))}'
+            )
+
+        # ── Diagnostic: check start & goal in obstacle_mask ─────────────
+        start_blocked = obstacle_mask[sr, sc] > 0
+        goal_blocked = obstacle_mask[gr, gc] > 0
+        self.get_logger().info(
+            f'[A*] start({sc},{sr}) blocked={start_blocked}, '
+            f'goal({gc},{gr}) blocked={goal_blocked}'
+        )
+
+        # Print 5x5 window of obstacle_mask around start
+        r_lo = max(0, sr - 2)
+        r_hi = min(self.grid_rows, sr + 3)
+        c_lo = max(0, sc - 2)
+        c_hi = min(self.grid_cols, sc + 3)
+        window = obstacle_mask[r_lo:r_hi, c_lo:c_hi]
+        self.get_logger().info(
+            f'[A*] obstacle_mask 5x5 around start:\n{window}'
+        )
+        occ_window = occupancy[r_lo:r_hi, c_lo:c_hi]
+        self.get_logger().info(
+            f'[A*] occupancy 5x5 around start:\n{occ_window}'
+        )
+
+        # If start or goal is blocked after inflation, clear a small radius
+        if start_blocked:
+            self.get_logger().warn(
+                '[A*] Start is blocked after inflation! Clearing 3x3 around start.'
+            )
+            sr_lo = max(0, sr - 1)
+            sr_hi = min(self.grid_rows, sr + 2)
+            sc_lo = max(0, sc - 1)
+            sc_hi = min(self.grid_cols, sc + 2)
+            obstacle_mask[sr_lo:sr_hi, sc_lo:sc_hi] = 0
+
+        if goal_blocked:
+            self.get_logger().warn(
+                '[A*] Goal is blocked after inflation! Clearing 3x3 around goal.'
+            )
+            gr_lo = max(0, gr - 1)
+            gr_hi = min(self.grid_rows, gr + 2)
+            gc_lo = max(0, gc - 1)
+            gc_hi = min(self.grid_cols, gc + 2)
+            obstacle_mask[gr_lo:gr_hi, gc_lo:gc_hi] = 0
 
         # ── A* data structures ──────────────────────────────────────────
         # open_set: priority queue of (f_score, col, row)
@@ -496,6 +594,343 @@ class DirectionalPlannerServer(Node):
         self.get_logger().info(
             f'Published {len(path_msg.poses)} path arrow markers'
         )
+
+
+    # =====================================================================
+    # Goal topic callback — receive main goal, plan A*, generate semi-goals
+    # =====================================================================
+    def _goal_callback(self, msg: PoseStamped):
+        """Handle incoming goal from /goal_pose topic."""
+        if self.latest_layers is None or 'occupancy' not in self.latest_layers:
+            self.get_logger().warn('No map data yet, ignoring goal.')
+            return
+
+        if not self.enabled:
+            self.get_logger().warn('Planner not enabled, ignoring goal.')
+            return
+
+        goal_x = msg.pose.position.x
+        goal_y = msg.pose.position.y
+
+        # Get robot pose from TF
+        robot_pose = self._get_robot_pose()
+        if robot_pose is None:
+            self.get_logger().error('Cannot get robot pose from TF.')
+            return
+
+        start_x, start_y = robot_pose[0], robot_pose[1]
+
+        self.get_logger().info(
+            f'Goal received: ({goal_x:.2f}, {goal_y:.2f}) from '
+            f'({start_x:.2f}, {start_y:.2f})'
+        )
+
+        # Convert to grid
+        start_col, start_row = self._world_to_grid(start_x, start_y)
+        goal_col, goal_row = self._world_to_grid(goal_x, goal_y)
+
+        # ── Diagnostics ─────────────────────────────────────────────────
+        occupancy = self.latest_layers['occupancy']
+
+        # Dump map_info for coordinate tracing
+        if self.map_info is not None:
+            cx = self.map_info.pose.position.x
+            cy = self.map_info.pose.position.y
+            lx = self.map_info.length_x
+            ly = self.map_info.length_y
+            res = self.map_info.resolution
+            corner_x = cx - lx / 2.0
+            corner_y = cy - ly / 2.0
+            self.get_logger().info(
+                f'[MAP_INFO] center=({cx:.2f},{cy:.2f}) size=({lx:.1f},{ly:.1f}) '
+                f'res={res:.3f} corner=({corner_x:.2f},{corner_y:.2f})'
+            )
+
+        if self._in_bounds(start_col, start_row):
+            start_occ = occupancy[start_row, start_col]
+        else:
+            start_occ = float('nan')
+        if self._in_bounds(goal_col, goal_row):
+            goal_occ = occupancy[goal_row, goal_col]
+        else:
+            goal_occ = float('nan')
+
+        self.get_logger().info(
+            f'[DIAG] start_grid=({start_col},{start_row}) occ={start_occ:.3f}, '
+            f'goal_grid=({goal_col},{goal_row}) occ={goal_occ:.3f}, '
+            f'grid_size={self.grid_cols}x{self.grid_rows}'
+        )
+
+        # Map content analysis
+        n_free = int(np.sum(np.abs(occupancy) < 0.1))
+        n_wall = int(np.sum(occupancy > 0.5))
+        n_unk = int(np.sum(occupancy < -0.5))
+        self.get_logger().info(
+            f'[DIAG] occupancy stats: free(≈0)={n_free}, wall(≈1)={n_wall}, '
+            f'unknown(≈-1)={n_unk}, unique={np.unique(occupancy).tolist()}'
+        )
+
+        # Find where free cells actually are (first/last free row and col)
+        free_mask = np.abs(occupancy) < 0.1
+        free_rows = np.any(free_mask, axis=1)
+        free_cols = np.any(free_mask, axis=0)
+        if np.any(free_rows):
+            first_free_row = int(np.argmax(free_rows))
+            last_free_row = int(len(free_rows) - 1 - np.argmax(free_rows[::-1]))
+            first_free_col = int(np.argmax(free_cols))
+            last_free_col = int(len(free_cols) - 1 - np.argmax(free_cols[::-1]))
+            self.get_logger().info(
+                f'[DIAG] Free area rows=[{first_free_row}..{last_free_row}], '
+                f'cols=[{first_free_col}..{last_free_col}]'
+            )
+        else:
+            self.get_logger().error('[DIAG] NO FREE CELLS IN MAP!')
+
+        if not self._in_bounds(start_col, start_row):
+            self.get_logger().error(
+                f'Start ({start_x:.2f},{start_y:.2f}) outside map bounds '
+                f'grid=({start_col},{start_row})'
+            )
+            return
+        if not self._in_bounds(goal_col, goal_row):
+            self.get_logger().error(
+                f'Goal ({goal_x:.2f},{goal_y:.2f}) outside map bounds '
+                f'grid=({goal_col},{goal_row})'
+            )
+            return
+
+        # Run A*
+        path_cells = self._astar_directional(start_col, start_row,
+                                              goal_col, goal_row)
+        if path_cells is None:
+            self.get_logger().error('No path found to goal.')
+            return
+
+        # Build nav_msgs/Path
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = self.map_frame
+
+        for col, row in path_cells:
+            wx, wy = self._grid_to_world(col, row)
+            ps = PoseStamped()
+            ps.header = path_msg.header
+            ps.pose.position.x = wx
+            ps.pose.position.y = wy
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.w = 1.0
+            path_msg.poses.append(ps)
+
+        # Set orientations along path
+        for i in range(len(path_msg.poses) - 1):
+            p1 = path_msg.poses[i].pose.position
+            p2 = path_msg.poses[i + 1].pose.position
+            yaw = math.atan2(p2.y - p1.y, p2.x - p1.x)
+            path_msg.poses[i].pose.orientation.z = math.sin(yaw / 2.0)
+            path_msg.poses[i].pose.orientation.w = math.cos(yaw / 2.0)
+        if len(path_msg.poses) >= 2:
+            path_msg.poses[-1].pose.orientation = \
+                path_msg.poses[-2].pose.orientation
+
+        # Publish full path for RViz
+        self.path_pub.publish(path_msg)
+        if self.pub_markers:
+            self._publish_path_arrows(path_msg)
+
+        # Generate semi-goals
+        self.main_goal = (goal_x, goal_y)
+        self._generate_semi_goals(path_msg)
+
+    # =====================================================================
+    # Semi-goal generation from A* path
+    # =====================================================================
+    def _generate_semi_goals(self, path_msg: Path):
+        """Split path into semi-goals every semi_goal_spacing_m meters."""
+        if not path_msg.poses:
+            return
+
+        semi_goals = []
+        accumulated_dist = 0.0
+
+        # First semi-goal: the first pose (skip robot's current position)
+        # Start from index 1 to skip the robot's current location
+        last_x = path_msg.poses[0].pose.position.x
+        last_y = path_msg.poses[0].pose.position.y
+
+        for i in range(1, len(path_msg.poses)):
+            px = path_msg.poses[i].pose.position.x
+            py = path_msg.poses[i].pose.position.y
+            seg_dist = math.sqrt((px - last_x)**2 + (py - last_y)**2)
+            accumulated_dist += seg_dist
+            last_x, last_y = px, py
+
+            if accumulated_dist >= self.semi_goal_spacing:
+                q = path_msg.poses[i].pose.orientation
+                yaw = math.atan2(
+                    2.0 * (q.w * q.z + q.x * q.y),
+                    1.0 - 2.0 * (q.y**2 + q.z**2),
+                )
+                semi_goals.append((px, py, yaw))
+                accumulated_dist = 0.0
+
+        # Always add the final goal as the last semi-goal
+        last_pose = path_msg.poses[-1]
+        lx = last_pose.pose.position.x
+        ly = last_pose.pose.position.y
+        lq = last_pose.pose.orientation
+        lyaw = math.atan2(
+            2.0 * (lq.w * lq.z + lq.x * lq.y),
+            1.0 - 2.0 * (lq.y**2 + lq.z**2),
+        )
+        # Don't duplicate if the last semi-goal is very close
+        if not semi_goals or math.sqrt(
+            (lx - semi_goals[-1][0])**2 + (ly - semi_goals[-1][1])**2
+        ) > 0.1:
+            semi_goals.append((lx, ly, lyaw))
+
+        self.semi_goals = semi_goals
+        self.current_sg_idx = 0
+        self.navigating = True
+
+        self.get_logger().info(
+            f'Generated {len(semi_goals)} semi-goals '
+            f'(spacing={self.semi_goal_spacing}m)'
+        )
+
+        # Publish debug markers for ALL semi-goals
+        self._publish_sg_markers()
+
+        # Publish the FIRST semi-goal immediately
+        self._publish_current_semi_goal()
+
+    # =====================================================================
+    # Semi-goal tick — monitor robot and advance
+    # =====================================================================
+    def _semi_goal_tick(self):
+        """Check if robot reached current semi-goal; if so, publish next."""
+        if not self.navigating or not self.semi_goals:
+            return
+
+        robot_pose = self._get_robot_pose()
+        if robot_pose is None:
+            return
+
+        rx, ry = robot_pose[0], robot_pose[1]
+        sx, sy, _ = self.semi_goals[self.current_sg_idx]
+
+        dist = math.sqrt((sx - rx)**2 + (sy - ry)**2)
+
+        if dist <= self.semi_goal_tolerance:
+            self.get_logger().info(
+                f'Semi-goal {self.current_sg_idx + 1}/'
+                f'{len(self.semi_goals)} reached (dist={dist:.3f}m)'
+            )
+            self.current_sg_idx += 1
+
+            if self.current_sg_idx >= len(self.semi_goals):
+                # All semi-goals completed
+                self.navigating = False
+                self.get_logger().info(
+                    '✅ All semi-goals reached. Navigation complete!'
+                )
+                return
+
+            # Publish next semi-goal
+            self._publish_current_semi_goal()
+            # Update markers (color changes)
+            self._publish_sg_markers()
+
+    def _publish_current_semi_goal(self):
+        """Publish current semi-goal as PoseStamped on /mission_goals."""
+        if self.current_sg_idx >= len(self.semi_goals):
+            return
+
+        sx, sy, syaw = self.semi_goals[self.current_sg_idx]
+
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
+        msg.pose.position.x = float(sx)
+        msg.pose.position.y = float(sy)
+        msg.pose.position.z = 0.0
+        msg.pose.orientation.z = math.sin(syaw / 2.0)
+        msg.pose.orientation.w = math.cos(syaw / 2.0)
+
+        self.mission_pub.publish(msg)
+
+        self.get_logger().info(
+            f'→ Published semi-goal {self.current_sg_idx + 1}/'
+            f'{len(self.semi_goals)}: ({sx:.2f}, {sy:.2f})'
+        )
+
+    # =====================================================================
+    # Debug markers for semi-goals
+    # =====================================================================
+    def _publish_sg_markers(self):
+        """Publish all semi-goals as colored spheres in RViz2."""
+        marker_array = MarkerArray()
+
+        # Clear previous
+        clear = Marker()
+        clear.header.stamp = self.get_clock().now().to_msg()
+        clear.header.frame_id = self.map_frame
+        clear.ns = 'semi_goals'
+        clear.id = 0
+        clear.action = Marker.DELETEALL
+        marker_array.markers.append(clear)
+
+        for i, (sx, sy, syaw) in enumerate(self.semi_goals):
+            m = Marker()
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.header.frame_id = self.map_frame
+            m.ns = 'semi_goals'
+            m.id = i + 1
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = float(sx)
+            m.pose.position.y = float(sy)
+            m.pose.position.z = 0.3
+            m.scale.x = 0.25
+            m.scale.y = 0.25
+            m.scale.z = 0.25
+
+            if i < self.current_sg_idx:
+                # Reached → dim green
+                m.color = ColorRGBA(r=0.3, g=0.7, b=0.3, a=0.4)
+            elif i == self.current_sg_idx:
+                # Current → bright cyan
+                m.color = ColorRGBA(r=0.0, g=1.0, b=1.0, a=1.0)
+            elif i == len(self.semi_goals) - 1:
+                # Final goal → red
+                m.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.9)
+            else:
+                # Pending → blue
+                m.color = ColorRGBA(r=0.2, g=0.4, b=1.0, a=0.7)
+
+            m.lifetime.sec = 0  # persistent
+            marker_array.markers.append(m)
+
+        self.sg_marker_pub.publish(marker_array)
+
+    # =====================================================================
+    # Robot pose from TF
+    # =====================================================================
+    def _get_robot_pose(self):
+        """Get robot (x, y, yaw) in map frame."""
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, rclpy.time.Time()
+            )
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            q = t.transform.rotation
+            yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y**2 + q.z**2),
+            )
+            return x, y, yaw
+        except Exception:
+            return None
 
 
 def main(args=None):

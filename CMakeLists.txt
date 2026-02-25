@@ -35,6 +35,7 @@ install(PROGRAMS
   scripts/map_processor_node.py
   scripts/exploration_manager_node.py
   scripts/directional_planner_server.py
+  scripts/map_loader_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
