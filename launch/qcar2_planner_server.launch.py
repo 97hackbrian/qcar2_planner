@@ -50,7 +50,7 @@ def generate_launch_description():
     )
     goal_topic_arg = DeclareLaunchArgument(
         'goal_input_topic',
-        default_value='/goal_pose',
+        default_value='/bt/goal',
         description='Topic for receiving the main navigation goal'
     )
     mission_topic_arg = DeclareLaunchArgument(

@@ -93,7 +93,7 @@ directional_planner_server:
     publish_path_markers: true
 
     # --- Goal Input (configurable topic) ---
-    goal_input_topic: "/goal_pose"
+    goal_input_topic: "/bt/goal"
 
     # --- Semi-Goal Navigation ---
     mission_goals_topic: "/mission_goals"
