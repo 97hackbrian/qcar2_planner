@@ -762,22 +762,23 @@ class DirectionalPlannerServer(Node):
         if self.pub_markers:
             self._publish_path_arrows(path_msg)
 
-        # Generate semi-goals
+        # Generate semi-goals (pass original goal msg for last waypoint)
         self.main_goal = (goal_x, goal_y)
-        self._generate_semi_goals(path_msg)
+        self._generate_semi_goals(path_msg, msg)
 
     # =====================================================================
     # Semi-goal generation from A* path
     # =====================================================================
-    def _generate_semi_goals(self, path_msg: Path):
-        """Split path into semi-goals every semi_goal_spacing_m meters."""
+    def _generate_semi_goals(self, path_msg: Path, original_goal: PoseStamped = None):
+        """Split path into semi-goals every semi_goal_spacing_m meters.
+        Orientations point toward the NEXT semi-goal.
+        Last semi-goal is a copy of the original /bt/goal."""
         if not path_msg.poses:
             return
 
         semi_goals = []
         accumulated_dist = 0.0
 
-        # First semi-goal: the first pose (skip robot's current position)
         # Start from index 1 to skip the robot's current location
         last_x = path_msg.poses[0].pose.position.x
         last_y = path_msg.poses[0].pose.position.y
@@ -790,28 +791,48 @@ class DirectionalPlannerServer(Node):
             last_x, last_y = px, py
 
             if accumulated_dist >= self.semi_goal_spacing:
-                q = path_msg.poses[i].pose.orientation
-                yaw = math.atan2(
-                    2.0 * (q.w * q.z + q.x * q.y),
-                    1.0 - 2.0 * (q.y**2 + q.z**2),
-                )
-                semi_goals.append((px, py, yaw))
+                semi_goals.append((px, py, 0.0))  # yaw will be recalculated
                 accumulated_dist = 0.0
 
-        # Always add the final goal as the last semi-goal
-        last_pose = path_msg.poses[-1]
-        lx = last_pose.pose.position.x
-        ly = last_pose.pose.position.y
-        lq = last_pose.pose.orientation
-        lyaw = math.atan2(
-            2.0 * (lq.w * lq.z + lq.x * lq.y),
-            1.0 - 2.0 * (lq.y**2 + lq.z**2),
-        )
-        # Don't duplicate if the last semi-goal is very close
-        if not semi_goals or math.sqrt(
-            (lx - semi_goals[-1][0])**2 + (ly - semi_goals[-1][1])**2
-        ) > 0.1:
-            semi_goals.append((lx, ly, lyaw))
+        # ── Last semi-goal = copy of /bt/goal ────────────────────────────
+        if original_goal is not None:
+            gx = original_goal.pose.position.x
+            gy = original_goal.pose.position.y
+            gq = original_goal.pose.orientation
+            gyaw = math.atan2(
+                2.0 * (gq.w * gq.z + gq.x * gq.y),
+                1.0 - 2.0 * (gq.y**2 + gq.z**2),
+            )
+            # Don't duplicate if very close to last semi-goal
+            if not semi_goals or math.sqrt(
+                (gx - semi_goals[-1][0])**2 + (gy - semi_goals[-1][1])**2
+            ) > 0.1:
+                semi_goals.append((gx, gy, gyaw))
+            else:
+                # Replace last with exact goal position + orientation
+                semi_goals[-1] = (gx, gy, gyaw)
+        else:
+            # Fallback: use last path pose
+            last_pose = path_msg.poses[-1]
+            lx = last_pose.pose.position.x
+            ly = last_pose.pose.position.y
+            lq = last_pose.pose.orientation
+            lyaw = math.atan2(
+                2.0 * (lq.w * lq.z + lq.x * lq.y),
+                1.0 - 2.0 * (lq.y**2 + lq.z**2),
+            )
+            if not semi_goals or math.sqrt(
+                (lx - semi_goals[-1][0])**2 + (ly - semi_goals[-1][1])**2
+            ) > 0.1:
+                semi_goals.append((lx, ly, lyaw))
+
+        # ── Recalculate orientations: each points toward the NEXT ────────
+        for i in range(len(semi_goals) - 1):
+            sx, sy, _ = semi_goals[i]
+            nx, ny, _ = semi_goals[i + 1]
+            yaw = math.atan2(ny - sy, nx - sx)
+            semi_goals[i] = (sx, sy, yaw)
+        # Last semi-goal keeps its original orientation (from /bt/goal)
 
         self.semi_goals = semi_goals
         self.current_sg_idx = 0
