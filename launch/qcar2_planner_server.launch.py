@@ -40,7 +40,7 @@ def generate_launch_description():
     )
     map_yaml_arg = DeclareLaunchArgument(
         'map_yaml_path',
-        default_value='/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/mapV4uncertainty.yaml',
+        default_value='/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/mapV5uncertainty.yaml',
         description='Path to the saved map YAML file (required for auto_enable=false)'
     )
     use_sim_time_arg = DeclareLaunchArgument(
