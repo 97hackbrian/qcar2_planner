@@ -98,15 +98,15 @@ directional_planner_server:
     # --- Semi-Goal Navigation ---
     mission_goals_topic: "/mission_goals"
     semi_goals_markers_topic: "/semi_goals_markers"
-    semi_goal_spacing_m: 1.0
-    semi_goal_tolerance: 0.3
+    semi_goal_spacing_m: 0.6
+    semi_goal_tolerance: 0.35
 
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
 
     # --- Ackermann Constraints ---
     max_turn_angle_deg: 110.0 # max turn angle (>120° = hard-blocked)
-    right_bias_penalty: 2.9 # gradient-based right wall attraction strength 0.9
+    right_bias_penalty: 0.25 # gradient-based right wall attraction strength 0.9
     forward_lock_cells: 20 # strict 90° forward within this radius (cells from start)
 
 map_loader_node:
