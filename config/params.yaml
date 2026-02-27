@@ -98,7 +98,7 @@ directional_planner_server:
     # --- Semi-Goal Navigation ---
     mission_goals_topic: "/mission_goals"
     semi_goals_markers_topic: "/semi_goals_markers"
-    semi_goal_spacing_m: 1.5
+    semi_goal_spacing_m: 1.0
     semi_goal_tolerance: 0.35
 
     # --- Auto-enable (set via launch, not here) ---
@@ -112,7 +112,7 @@ directional_planner_server:
 map_loader_node:
   ros__parameters:
     # --- Map File ---
-    map_yaml_path: "/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/mapV5uncertainty.yaml" # set via launch arg
+    map_yaml_path: "/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/mapV4uncertainty.yaml" # set via launch arg
 
     # --- Morphological Post-Processing ---
     morph_kernel_size: 3 # kernel for opening + closing
