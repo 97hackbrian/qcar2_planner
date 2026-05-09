@@ -120,7 +120,7 @@ class MapOverlayNode(Node):
         self.declare_parameter('icp_min_cartographer_points', 50)
         self.declare_parameter('morph_kernel_size', 3)
         self.declare_parameter('border_dilation_px', 2)
-        self.declare_parameter('pgm_scale_factor', 0.5) # New scale factor parameter
+        self.declare_parameter('pgm_scale_factor', 0.495) # New scale factor parameter
         self.declare_parameter('publish_rate', 1.0)
         self.declare_parameter('map_frame', 'map')       # Cartographer frame
         self.declare_parameter('pgm_frame', 'pgm_map')   # New Root Frame

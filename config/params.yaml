@@ -17,7 +17,7 @@ map_overlay_node:
     # --- Map Processing ---
     morph_kernel_size: 0
     border_dilation_px: 0 # dilate PGM borders for better ICP matching
-    pgm_scale_factor: 0.5 # Scale the image pixels when loading
+    pgm_scale_factor: 0.477 # Scale the image pixels when loading
     
     # --- Publishing ---
     publish_rate: 1.0
