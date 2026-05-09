@@ -67,9 +67,7 @@ def get_rigid_transform(A, B):
 
 def icp_2d(source, target, max_iterations=50, tolerance=0.001, max_dist=0.5):
     """
-    Point-to-point ICP in 2D.
-    source, target: Nx2, Mx2 numpy arrays
-    Returns (dx, dy, dtheta) applied to source to align with target.
+    Point-to-point ICP in 2D with dynamic thresholding (annealing).
     """
     src = np.copy(source)
     total_R = np.eye(2)
@@ -77,11 +75,16 @@ def icp_2d(source, target, max_iterations=50, tolerance=0.001, max_dist=0.5):
     prev_error = float('inf')
 
     for i in range(max_iterations):
+        # Annealing: start with a large search radius to pull distant walls, then shrink to max_dist
+        current_max_dist = max_dist
+        if i < max_iterations // 2:
+            current_max_dist = max_dist + (max_dist * 4.0) * (1.0 - (i / (max_iterations // 2)))
+
         distances = np.linalg.norm(src[:, np.newaxis, :] - target[np.newaxis, :, :], axis=2)
         indices = np.argmin(distances, axis=1)
         min_distances = np.min(distances, axis=1)
 
-        valid = min_distances < max_dist
+        valid = min_distances < current_max_dist
         matched_src = src[valid]
         matched_tgt = target[indices[valid]]
 
@@ -293,10 +296,9 @@ class MapOverlayNode(Node):
         self.carto_points = self._voxel_downsample(points, self.icp_ds_res)
 
     def initialpose_cb(self, msg: PoseWithCovarianceStamped):
-        if self.alignment_mode != 'manual':
-            self.get_logger().warn('Received /initialpose, but mode is not "manual".')
-            return
-
+        # Allow /initialpose in BOTH modes.
+        # In manual mode: it locks the transform exactly as clicked.
+        # In auto mode: it uses the click as an INITIAL GUESS and lets ICP refine it.
         try:
             # Robot pose in Cartographer's map frame
             t = self.tf_buffer.lookup_transform(self.map_frame, 'base_link', rclpy.time.Time())
@@ -318,12 +320,15 @@ class MapOverlayNode(Node):
             
             with self.lock:
                 self.tf_dx, self.tf_dy, self.tf_dtheta = dx, dy, dyaw
-                self.transform_locked = True
-
-            self.get_logger().info(f'Manual alignment applied! TF: dx={dx:.2f}, dy={dy:.2f}, dth={math.degrees(dyaw):.1f}°')
+                if self.alignment_mode == 'manual':
+                    self.transform_locked = True
+                    self.get_logger().info(f'Manual alignment locked! TF: dx={dx:.2f}, dy={dy:.2f}, dth={math.degrees(dyaw):.1f}°')
+                else:
+                    self.transform_locked = False # Unlock to let ICP run from this new seed
+                    self.get_logger().info(f'Seed alignment applied! ICP will now refine from: dx={dx:.2f}, dy={dy:.2f}, dth={math.degrees(dyaw):.1f}°')
             
         except Exception as e:
-            self.get_logger().error(f'Failed to compute manual alignment: {e}')
+            self.get_logger().error(f'Failed to compute initial alignment: {e}')
 
     def align_srv_cb(self, request, response):
         with self.lock:
@@ -347,12 +352,17 @@ class MapOverlayNode(Node):
             return
 
         self.get_logger().info('Starting ICP alignment...')
-        # We want to find T_pgm_map.
-        # Carto points are in map. PGM points are in pgm_map.
-        # T_pgm_map * carto_point = carto_point_in_pgm ≈ pgm_point
-        # So source=carto, target=pgm. ICP finds (R, t) such that target ≈ R*source + t.
+        
+        # Apply the CURRENT tf_dx, tf_dy, tf_dtheta as the initial guess for ICP
+        initial_R = np.array([
+            [math.cos(self.tf_dtheta), -math.sin(self.tf_dtheta)],
+            [math.sin(self.tf_dtheta),  math.cos(self.tf_dtheta)]
+        ])
+        # Transform carto points by current guess
+        seeded_carto = np.dot(self.carto_points, initial_R.T) + np.array([self.tf_dx, self.tf_dy])
+
         res, err = icp_2d(
-            self.carto_points, self.pgm_points,
+            seeded_carto, self.pgm_points,
             max_iterations=self.icp_max_iter,
             tolerance=self.icp_tol,
             max_dist=self.icp_max_dist
@@ -360,10 +370,23 @@ class MapOverlayNode(Node):
 
         if res is not None:
             dx, dy, dtheta = res
+            # Accumulate the transform: T_final = T_icp * T_initial
+            # final_theta = initial_theta + icp_theta
+            final_theta = normalize_angle(self.tf_dtheta + dtheta)
+            
+            # final_translation = R_icp * initial_translation + t_icp
+            R_icp = np.array([
+                [math.cos(dtheta), -math.sin(dtheta)],
+                [math.sin(dtheta),  math.cos(dtheta)]
+            ])
+            t_icp = np.array([dx, dy])
+            t_initial = np.array([self.tf_dx, self.tf_dy])
+            final_t = np.dot(R_icp, t_initial) + t_icp
+
             with self.lock:
-                self.tf_dx, self.tf_dy, self.tf_dtheta = dx, dy, dtheta
+                self.tf_dx, self.tf_dy, self.tf_dtheta = final_t[0], final_t[1], final_theta
                 self.transform_locked = True
-            self.get_logger().info(f'ICP Converged! TF: dx={dx:.2f}, dy={dy:.2f}, dth={math.degrees(dtheta):.1f}°')
+            self.get_logger().info(f'ICP Converged! Final TF: dx={final_t[0]:.2f}, dy={final_t[1]:.2f}, dth={math.degrees(final_theta):.1f}°')
         else:
             self.get_logger().warn(f'ICP failed: {err}')
 
