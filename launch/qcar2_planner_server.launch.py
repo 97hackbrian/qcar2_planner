@@ -66,11 +66,11 @@ def generate_launch_description():
     mission_goals_topic = LaunchConfiguration('mission_goals_topic')
 
     # =====================================================================
-    # MODE 1: auto_enable=true → Include existing mapping launch
+    # MODE 1: auto_enable=true → Include new overlay mapping launch
     # =====================================================================
     mapping_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(pkg_dir, 'launch', 'qcar2_mapping_planner.launch.py')
+            os.path.join(pkg_dir, 'launch', 'qcar2_overlay_planner.launch.py')
         ),
         launch_arguments={'use_sim_time': use_sim_time}.items(),
         condition=IfCondition(auto_enable),

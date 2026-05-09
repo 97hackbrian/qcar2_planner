@@ -19,7 +19,7 @@
     <depend>rclpy</depend>
     <depend>std_srvs</depend>
 
-    <!-- Messages -->
+    <!-- Messages & SLAM -->
     <depend>geometry_msgs</depend>
     <depend>nav_msgs</depend>
     <depend>sensor_msgs</depend>
@@ -27,6 +27,7 @@
     <depend>grid_map_msgs</depend>
     <depend>nav2_msgs</depend>
     <depend>std_msgs</depend>
+    <depend>cartographer_ros</depend>
 
     <!-- Perception & TF -->
     <depend>tf2_ros</depend>

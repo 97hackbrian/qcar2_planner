@@ -2,86 +2,36 @@
 # qcar2_planner — Configuration Parameters
 # =============================================================================
 
-map_processor_node:
+map_overlay_node:
   ros__parameters:
-    # --- Input Topics ---
-    mesh_marker_topic: "/nvblox_node/mesh_marker"
-    occupancy_grid_topic: "/map" # OccupancyGrid from Cartographer
-
-    # --- Wall Integration ---
-    wall_occupy_threshold: 50 # /map cells >= this → wall (0-100)
-
-    # --- TF Frames ---
-    map_frame: "map"
-    base_frame: "odom"
-
-    # --- Grid Dimensions ---
-    map_resolution: 0.05 # meters per cell
-    map_size_x: 20.0 # total width (m)
-    map_size_y: 20.0 # total height (m)
-    map_origin_x: 0.0 # center in world x
-    map_origin_y: 0.0 # center in world y
-
-    # --- Mesh Z-Filter ---
-    z_min: -0.5
-    z_max: 2.0
-
-    # --- Uncertainty Model ---
-    hits_threshold: 10 # nvblox hits for full certainty
-
+    # --- Alignment Mode ---
+    alignment_mode: "auto" # 'auto' (ICP) or 'manual' (/initialpose)
+    
+    # --- ICP Parameters ---
+    icp_max_iterations: 50
+    icp_convergence_threshold: 0.001
+    icp_max_correspondence_dist: 0.5
+    icp_downsample_resolution: 0.1
+    icp_min_cartographer_points: 50
+    
+    # --- Map Processing ---
+    morph_kernel_size: 0
+    border_dilation_px: 0 # dilate PGM borders for better ICP matching
+    pgm_scale_factor: 0.5 # Scale the image pixels when loading
+    
     # --- Publishing ---
-    publish_rate: 20.0 # Hz
-
-    # --- RViz2 Output Topics ---
+    publish_rate: 1.0
+    map_frame: "map"
+    
+    # --- Output Topics ---
     occupancy_out_topic: "/planner_occupancy"
     uncertainty_out_topic: "/planner_uncertainty"
-
-exploration_manager_node:
-  ros__parameters:
-    # --- Uncertainty Threshold ---
-    uncertainty_threshold: 0.19
-
-    # --- Working Area ---
-    work_area_x_min: -10.0
-    work_area_x_max: 10.0
-    work_area_y_min: -10.0
-    work_area_y_max: 10.0
-
-    # --- TF Frames ---
-    map_frame: "map"
-    base_frame: "base_link"
-    primary_tf_frame: "base_link"
-    secondary_tf_frame: "odom"
-
-    # --- Frontier Detection ---
-    frontier_min_size: 5
-    gradient_threshold: 0.3
-
-    # --- Frontier Angular Filter ---
-    frontier_fov_deg: 130.0 # total cone width (±65° from heading)
-    frontier_max_dist: 1.8 # max distance (m) from robot to goal
-
-    # --- Spline Path ---
-    spline_n_points: 3 # number of waypoints in the curved path
-    spline_wp_tolerance: 0.4 # distance (m) to consider waypoint reached
-    spline_curvature: 0.35 # 0.0 = straight, 0.5 = very curved, 1.0 = extreme
-
-    # --- Goal Offset ---
-    frontier_goal_offset_x: 0.8 # fixed offset in map X axis (meters)
-    frontier_goal_offset_y: -0.3 # fixed offset in map Y axis (meters)
-
-    # --- Goal Reached Detection ---
-    goal_reached_tolerance: 0.85 # radial tolerance (m) to consider goal reached
-    next_goal_offset_x: -2.0 # offset in X (m) from current frontier to next goal
-    next_goal_offset_y: -1.5 # offset in Y (m) from current frontier to next goal
-
-    # --- Publishing ---
-    publish_rate: 20.0
+    gridmap_out_topic: "/grid_map"
 
 directional_planner_server:
   ros__parameters:
     # --- TF Frames ---
-    map_frame: "map"
+    map_frame: "pgm_map"
     base_frame: "base_link" # robot heading frame (NOT odom!)
 
     # --- Planner ---
@@ -112,10 +62,10 @@ directional_planner_server:
 map_loader_node:
   ros__parameters:
     # --- Map File ---
-    map_yaml_path: "/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/mapV4uncertainty.yaml" # set via launch arg
+    map_yaml_path: "/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/map_ros.yaml" # set via launch arg
 
     # --- Morphological Post-Processing ---
-    morph_kernel_size: 3 # kernel for opening + closing
+    morph_kernel_size: 0 # kernel for opening + closing
 
     # --- Publishing ---
     publish_rate: 1.0

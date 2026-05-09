@@ -40,7 +40,7 @@ class MapLoaderNode(Node):
 
         # ── Parameters ──────────────────────────────────────────────────────
         self.declare_parameter('map_yaml_path', '/workspaces/isaac_ros-dev/ros2/utils/mapV4uncertainty.yaml')
-        self.declare_parameter('morph_kernel_size', 5)
+        self.declare_parameter('morph_kernel_size', 0)
         self.declare_parameter('publish_rate', 1.0)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('uncertainty_out_topic', '/planner_uncertainty')
