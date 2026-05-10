@@ -12,7 +12,7 @@ map_overlay_node:
     icp_convergence_threshold: 0.001
     icp_max_correspondence_dist: 0.5
     icp_downsample_resolution: 0.1
-    icp_min_cartographer_points: 450
+    icp_min_cartographer_points: 250
     
     # --- Map Processing ---
     morph_kernel_size: 0
@@ -20,7 +20,7 @@ map_overlay_node:
     pgm_scale_factor: 0.48 # Scale the image pixels when loading
     
     # --- Publishing ---
-    publish_rate: 1.0
+    publish_rate: 0.5
     map_frame: "map"
     
     # --- Output Topics ---
@@ -68,7 +68,7 @@ map_loader_node:
     morph_kernel_size: 0 # kernel for opening + closing
 
     # --- Publishing ---
-    publish_rate: 1.0
+    publish_rate: 0.5
     map_frame: "map"
 
     # --- Output Topics ---
