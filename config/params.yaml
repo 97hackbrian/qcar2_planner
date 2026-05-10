@@ -8,16 +8,16 @@ map_overlay_node:
     alignment_mode: "auto" # 'auto' (ICP) or 'manual' (/initialpose)
     
     # --- ICP Parameters ---
-    icp_max_iterations: 50
+    icp_max_iterations: 266
     icp_convergence_threshold: 0.001
     icp_max_correspondence_dist: 0.5
     icp_downsample_resolution: 0.1
-    icp_min_cartographer_points: 50
+    icp_min_cartographer_points: 450
     
     # --- Map Processing ---
     morph_kernel_size: 0
     border_dilation_px: 0 # dilate PGM borders for better ICP matching
-    pgm_scale_factor: 0.477 # Scale the image pixels when loading
+    pgm_scale_factor: 0.48 # Scale the image pixels when loading
     
     # --- Publishing ---
     publish_rate: 1.0
