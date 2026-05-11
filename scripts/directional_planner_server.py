@@ -300,7 +300,7 @@ class DirectionalPlannerServer(Node):
         # ── Convert path to nav_msgs/Path ───────────────────────────────
         path_msg = Path()
         path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = 'map'
+        path_msg.header.frame_id = self.map_frame
 
         for col, row in path_cells:
             wx, wy = self._grid_to_world(col, row)
