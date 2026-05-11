@@ -48,8 +48,8 @@ directional_planner_server:
     # --- Semi-Goal Navigation ---
     mission_goals_topic: "/mission_goals"
     semi_goals_markers_topic: "/semi_goals_markers"
-    semi_goal_spacing_m: 0.45
-    semi_goal_tolerance: 0.25
+    semi_goal_spacing_m: 0.12
+    semi_goal_tolerance: 0.06
 
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
