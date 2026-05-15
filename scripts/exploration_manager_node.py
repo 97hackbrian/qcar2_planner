@@ -58,7 +58,7 @@ class ExplorationManagerNode(Node):
         self.declare_parameter('frontier_min_size', 5)
         self.declare_parameter('gradient_threshold', 0.3)
         self.declare_parameter('publish_rate', 1.0)
-        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('map_frame', 'pgm_map')
         self.declare_parameter('base_frame', 'odom')
         self.declare_parameter('frontier_fov_deg', 140.0)
         self.declare_parameter('frontier_max_dist', 5.0)
@@ -414,7 +414,7 @@ class ExplorationManagerNode(Node):
         if best_frontier is not None:
             marker = Marker()
             marker.header.stamp = self.get_clock().now().to_msg()
-            marker.header.frame_id = 'map'
+            marker.header.frame_id = self.map_frame
             marker.ns = 'frontiers'
             marker.id = best_frontier['label_id']
             marker.type = Marker.SPHERE
@@ -608,7 +608,7 @@ class ExplorationManagerNode(Node):
 
         goal = PoseStamped()
         goal.header.stamp = self.get_clock().now().to_msg()
-        goal.header.frame_id = 'map'
+        goal.header.frame_id = self.map_frame
         goal.pose.position.x = wx
         goal.pose.position.y = wy
         goal.pose.position.z = 0.0
@@ -631,7 +631,7 @@ class ExplorationManagerNode(Node):
         for i, (wx, wy, wyaw) in enumerate(self.spline_waypoints):
             marker = Marker()
             marker.header.stamp = self.get_clock().now().to_msg()
-            marker.header.frame_id = 'map'
+            marker.header.frame_id = self.map_frame
             marker.ns = 'spline'
             marker.id = 1000 + i
             marker.type = Marker.ARROW
