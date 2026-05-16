@@ -10,9 +10,10 @@ map_overlay_node:
     # --- ICP Parameters ---
     icp_max_iterations: 266
     icp_convergence_threshold: 0.001
-    icp_max_correspondence_dist: 0.5
+    icp_max_correspondence_dist: 1.5
     icp_downsample_resolution: 0.1
-    icp_min_cartographer_points: 250
+    icp_min_cartographer_points: 150
+    overlay_max_lidar_range_m: 4.0
     
     # --- Map Processing ---
     morph_kernel_size: 0

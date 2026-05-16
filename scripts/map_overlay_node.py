@@ -121,6 +121,7 @@ class MapOverlayNode(Node):
         self.declare_parameter('icp_max_correspondence_dist', 1.0)
         self.declare_parameter('icp_downsample_resolution', 0.2)
         self.declare_parameter('icp_min_cartographer_points', 50)
+        self.declare_parameter('overlay_max_lidar_range_m', 6.0)
         self.declare_parameter('morph_kernel_size', 3)
         self.declare_parameter('border_dilation_px', 2)
         self.declare_parameter('pgm_scale_factor', 0.495) # New scale factor parameter
@@ -138,6 +139,7 @@ class MapOverlayNode(Node):
         self.icp_max_dist = float(self.get_parameter('icp_max_correspondence_dist').value)
         self.icp_ds_res = float(self.get_parameter('icp_downsample_resolution').value)
         self.icp_min_pts = int(self.get_parameter('icp_min_cartographer_points').value)
+        self.overlay_max_lidar_range_m = float(self.get_parameter('overlay_max_lidar_range_m').value)
         self.morph_kernel_size = int(self.get_parameter('morph_kernel_size').value)
         self.border_dilation_px = int(self.get_parameter('border_dilation_px').value)
         self.pgm_scale_factor = float(self.get_parameter('pgm_scale_factor').value)
@@ -293,6 +295,17 @@ class MapOverlayNode(Node):
         pts_x = ox + (x_idx + 0.5) * res
         pts_y = oy + (y_idx + 0.5) * res
         points = np.column_stack((pts_x, pts_y))
+
+        if self.overlay_max_lidar_range_m > 0.0 and len(points) > 0:
+            try:
+                t = self.tf_buffer.lookup_transform(self.map_frame, 'base_link', rclpy.time.Time())
+                rx = t.transform.translation.x
+                ry = t.transform.translation.y
+                d2 = (points[:, 0] - rx) ** 2 + (points[:, 1] - ry) ** 2
+                points = points[d2 <= (self.overlay_max_lidar_range_m ** 2)]
+            except Exception:
+                pass
+
         self.carto_points = self._voxel_downsample(points, self.icp_ds_res)
 
     def initialpose_cb(self, msg: PoseWithCovarianceStamped):

@@ -32,8 +32,8 @@ MAP_BUILDER.use_trajectory_builder_2d = true
 
 -- ── Trajectory builder tuning ──────────────────────────────────
 TRAJECTORY_BUILDER_2D.min_range = 0.05
-TRAJECTORY_BUILDER_2D.max_range = 10.0
-TRAJECTORY_BUILDER_2D.missing_data_ray_length = 5.
+TRAJECTORY_BUILDER_2D.max_range = 4.0
+TRAJECTORY_BUILDER_2D.missing_data_ray_length = 4.
 TRAJECTORY_BUILDER_2D.use_imu_data = true    -- ENABLE IMU FUSION
 
 -- Since we rely on Lidar odometry, we need correlative scan matching to be effective
