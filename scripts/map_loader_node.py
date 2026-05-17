@@ -45,6 +45,7 @@ class MapLoaderNode(Node):
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('uncertainty_out_topic', '/planner_uncertainty')
         self.declare_parameter('gridmap_out_topic', '/grid_map')
+        self.declare_parameter('lanes_yaml_path', '')
 
         self.map_yaml_path = str(self.get_parameter('map_yaml_path').value)
         self.morph_kernel_size = int(self.get_parameter('morph_kernel_size').value)
@@ -65,6 +66,7 @@ class MapLoaderNode(Node):
         # ── Load map ────────────────────────────────────────────────────────
         self.get_logger().info(f'Loading map from: {self.map_yaml_path}')
         self._load_map()
+        self._load_lanes()
 
         # ── Publishers ──────────────────────────────────────────────────────
         # Transient-local so late subscribers get the last message
@@ -167,9 +169,11 @@ class MapLoaderNode(Node):
             img_f[free_mask] / max(free_thresh, 0.01), 0.0, 1.0
         )
 
-        # No direction info from saved map
+        # No direction info from saved map (will be populated by lanes if present)
+        self.lane_mask = np.zeros((self.rows, self.cols), dtype=np.float32)
         self.dir_x = np.zeros((self.rows, self.cols), dtype=np.float32)
         self.dir_y = np.zeros((self.rows, self.cols), dtype=np.float32)
+        self.independent_lanes = {}
 
         # Grid geometry for GridMap (center-based)
         self.size_x = self.cols * self.resolution
@@ -183,6 +187,83 @@ class MapLoaderNode(Node):
         self.get_logger().info(
             f'Map classified: free={n_free}, wall={n_wall}, unknown={n_unk}'
         )
+
+    def _load_lanes(self):
+        lanes_yaml_path = str(self.get_parameter('lanes_yaml_path').value)
+        if not os.path.isfile(lanes_yaml_path):
+            self.get_logger().warn(f'No lanes.yaml found at {lanes_yaml_path}. Lane layers will be empty.')
+            return
+            
+        with open(lanes_yaml_path, 'r') as f:
+            lanes_data = yaml.safe_load(f)
+            
+        if not lanes_data or 'lanes' not in lanes_data:
+            self.get_logger().warn('lanes.yaml is empty or invalid format.')
+            return
+            
+        lanes = lanes_data['lanes']
+        self.get_logger().info(f'Loaded {len(lanes)} lanes from config.')
+        
+        # 1) Build independent lane grids
+        for idx, lane in enumerate(lanes):
+            internal_id = f"lane_{idx + 1:03d}"
+            original_name = lane.get('name', '')
+            name = original_name if original_name else internal_id
+            
+            width = float(lane.get('width', 0.0))
+            points = lane.get('points', [])
+            
+            if not points or width <= 0.0:
+                self.get_logger().warn(f'Skipping {internal_id} ({name}): missing points or width.')
+                continue
+                
+            if len(points) < 2:
+                continue
+                
+            width_px = width / self.resolution
+            
+            lane_mask = np.zeros((self.rows, self.cols), dtype=np.float32)
+            lane_dir_x = np.zeros((self.rows, self.cols), dtype=np.float32)
+            lane_dir_y = np.zeros((self.rows, self.cols), dtype=np.float32)
+            
+            for i in range(len(points) - 1):
+                p1 = points[i]
+                p2 = points[i+1]
+                
+                c1 = int((p1[0] - self.origin_x) / self.resolution - 0.5)
+                r1 = int((p1[1] - self.origin_y) / self.resolution - 0.5)
+                c2 = int((p2[0] - self.origin_x) / self.resolution - 0.5)
+                r2 = int((p2[1] - self.origin_y) / self.resolution - 0.5)
+                
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                mag = math.sqrt(dx*dx + dy*dy)
+                if mag < 1e-6:
+                    continue
+                ux = dx / mag
+                uy = dy / mag
+                
+                thickness = max(1, int(width_px))
+                cv2.line(lane_mask, (c1, r1), (c2, r2), 1.0, thickness)
+                cv2.line(lane_dir_x, (c1, r1), (c2, r2), float(ux), thickness)
+                cv2.line(lane_dir_y, (c1, r1), (c2, r2), float(uy), thickness)
+            
+            self.independent_lanes[internal_id] = {
+                'original_name': original_name,
+                'name': name,
+                'mask': lane_mask,
+                'dir_x': lane_dir_x,
+                'dir_y': lane_dir_y
+            }
+            
+            # Combine into global visualization mask
+            cv2.max(self.lane_mask, lane_mask, self.lane_mask)
+            mask_indices = lane_mask > 0.0
+            self.dir_x[mask_indices] = lane_dir_x[mask_indices]
+            self.dir_y[mask_indices] = lane_dir_y[mask_indices]
+                
+        n_mask = int(np.sum(self.lane_mask > 0))
+        self.get_logger().info(f'Total lane_mask cells: {n_mask}')
 
     # =====================================================================
     # Publish all outputs
@@ -246,8 +327,8 @@ class MapLoaderNode(Node):
         msg.info.pose.position.z = 0.0
         msg.info.pose.orientation.w = 1.0
 
-        names = ['occupancy', 'uncertainty', 'dir_x', 'dir_y']
-        arrays = [self.occupancy, self.uncertainty, self.dir_x, self.dir_y]
+        names = ['occupancy', 'uncertainty', 'lane_mask', 'dir_x', 'dir_y']
+        arrays = [self.occupancy, self.uncertainty, self.lane_mask, self.dir_x, self.dir_y]
         msg.layers = names
         msg.basic_layers = ['occupancy', 'uncertainty']
 

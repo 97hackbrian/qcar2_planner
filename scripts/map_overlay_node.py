@@ -122,9 +122,9 @@ class MapOverlayNode(Node):
         self.declare_parameter('icp_downsample_resolution', 0.2)
         self.declare_parameter('icp_min_cartographer_points', 50)
         self.declare_parameter('overlay_max_lidar_range_m', 6.0)
+        self.declare_parameter('icp_min_wall_component_size', 25)
         self.declare_parameter('morph_kernel_size', 3)
         self.declare_parameter('border_dilation_px', 2)
-        self.declare_parameter('icp_min_wall_component_size', 25)
         self.declare_parameter('pgm_scale_factor', 0.495) # New scale factor parameter
         self.declare_parameter('publish_rate', 0.5)
         self.declare_parameter('map_frame', 'map')       # Cartographer frame
@@ -141,9 +141,9 @@ class MapOverlayNode(Node):
         self.icp_ds_res = float(self.get_parameter('icp_downsample_resolution').value)
         self.icp_min_pts = int(self.get_parameter('icp_min_cartographer_points').value)
         self.overlay_max_lidar_range_m = float(self.get_parameter('overlay_max_lidar_range_m').value)
+        self.icp_min_wall_component_size = int(self.get_parameter('icp_min_wall_component_size').value)
         self.morph_kernel_size = int(self.get_parameter('morph_kernel_size').value)
         self.border_dilation_px = int(self.get_parameter('border_dilation_px').value)
-        self.icp_min_wall_component_size = int(self.get_parameter('icp_min_wall_component_size').value)
         self.pgm_scale_factor = float(self.get_parameter('pgm_scale_factor').value)
         self.publish_rate = float(self.get_parameter('publish_rate').value)
         self.map_frame = str(self.get_parameter('map_frame').value)
@@ -159,6 +159,12 @@ class MapOverlayNode(Node):
         self.tf_dx = 0.0
         self.tf_dy = 0.0
         self.tf_dtheta = 0.0
+        
+        # Lane layers (static)
+        self.lane_mask = None
+        self.lane_dir_x = None
+        self.lane_dir_y = None
+        self.independent_lanes = {} # internal_id -> {mask, dir_x, dir_y, name, original_name}
         
         # PGM Map data (static)
         self.pgm_occupancy = None
@@ -183,6 +189,7 @@ class MapOverlayNode(Node):
             self.get_logger().fatal(f'Valid map_yaml_path required. Got: {self.map_yaml_path}')
             raise FileNotFoundError(f'{self.map_yaml_path}')
         self._load_pgm_map()
+        self._load_lanes()
 
         # ── Publishers ──────────────────────────────────────────────────────
         qos_latched = QoSProfile(
@@ -278,6 +285,88 @@ class MapOverlayNode(Node):
         voxel_indices = np.floor(points / voxel_size).astype(np.int32)
         _, unique_indices = np.unique(voxel_indices, axis=0, return_index=True)
         return points[unique_indices]
+
+    def _load_lanes(self):
+        self.lane_mask = np.zeros((self.pgm_rows, self.pgm_cols), dtype=np.float32)
+        self.lane_dir_x = np.zeros((self.pgm_rows, self.pgm_cols), dtype=np.float32)
+        self.lane_dir_y = np.zeros((self.pgm_rows, self.pgm_cols), dtype=np.float32)
+        self.independent_lanes = {}
+        
+        lanes_yaml_path = os.path.join(os.path.dirname(self.map_yaml_path), 'lanes.yaml')
+        if not os.path.isfile(lanes_yaml_path):
+            self.get_logger().warn(f'No lanes.yaml found at {lanes_yaml_path}. Lane layers will be empty.')
+            return
+            
+        with open(lanes_yaml_path, 'r') as f:
+            lanes_data = yaml.safe_load(f)
+            
+        if not lanes_data or 'lanes' not in lanes_data:
+            self.get_logger().warn('lanes.yaml is empty or invalid format.')
+            return
+            
+        lanes = lanes_data['lanes']
+        self.get_logger().info(f'Loaded {len(lanes)} lanes from config.')
+        
+        # 1) Build independent lane grids
+        for idx, lane in enumerate(lanes):
+            internal_id = f"lane_{idx + 1:03d}"
+            original_name = lane.get('name', '')
+            name = original_name if original_name else internal_id
+            
+            width = float(lane.get('width', 0.0))
+            points = lane.get('points', [])
+            
+            if not points or width <= 0.0:
+                self.get_logger().warn(f'Skipping {internal_id} ({name}): missing points or width.')
+                continue
+                
+            if len(points) < 2:
+                continue
+                
+            width_px = width / self.pgm_resolution
+            
+            lane_mask = np.zeros((self.pgm_rows, self.pgm_cols), dtype=np.float32)
+            lane_dir_x = np.zeros((self.pgm_rows, self.pgm_cols), dtype=np.float32)
+            lane_dir_y = np.zeros((self.pgm_rows, self.pgm_cols), dtype=np.float32)
+            
+            for i in range(len(points) - 1):
+                p1 = points[i]
+                p2 = points[i+1]
+                
+                c1 = int((p1[0] - self.pgm_origin_x) / self.pgm_resolution - 0.5)
+                r1 = int((p1[1] - self.pgm_origin_y) / self.pgm_resolution - 0.5)
+                c2 = int((p2[0] - self.pgm_origin_x) / self.pgm_resolution - 0.5)
+                r2 = int((p2[1] - self.pgm_origin_y) / self.pgm_resolution - 0.5)
+                
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                mag = math.sqrt(dx*dx + dy*dy)
+                if mag < 1e-6:
+                    continue
+                ux = dx / mag
+                uy = dy / mag
+                
+                thickness = max(1, int(width_px))
+                cv2.line(lane_mask, (c1, r1), (c2, r2), 1.0, thickness)
+                cv2.line(lane_dir_x, (c1, r1), (c2, r2), float(ux), thickness)
+                cv2.line(lane_dir_y, (c1, r1), (c2, r2), float(uy), thickness)
+            
+            self.independent_lanes[internal_id] = {
+                'original_name': original_name,
+                'name': name,
+                'mask': lane_mask,
+                'dir_x': lane_dir_x,
+                'dir_y': lane_dir_y
+            }
+            
+            # Combine into global visualization mask
+            cv2.max(self.lane_mask, lane_mask, self.lane_mask)
+            mask_indices = lane_mask > 0.0
+            self.lane_dir_x[mask_indices] = lane_dir_x[mask_indices]
+            self.lane_dir_y[mask_indices] = lane_dir_y[mask_indices]
+                
+        n_mask = int(np.sum(self.lane_mask > 0))
+        self.get_logger().info(f'Total lane_mask cells: {n_mask}')
 
     # =====================================================================
     # Callbacks
@@ -512,11 +601,17 @@ class MapOverlayNode(Node):
         msg.info.pose.position.z = 0.0
         msg.info.pose.orientation.w = 1.0
 
-        dir_x = np.zeros_like(occ)
-        dir_y = np.zeros_like(occ)
+        if self.lane_mask is None:
+            lane_mask = np.zeros_like(occ)
+            dir_x = np.zeros_like(occ)
+            dir_y = np.zeros_like(occ)
+        else:
+            lane_mask = self.lane_mask
+            dir_x = self.lane_dir_x
+            dir_y = self.lane_dir_y
 
-        names = ['occupancy', 'uncertainty', 'dir_x', 'dir_y']
-        arrays = [occ, unc, dir_x, dir_y]
+        names = ['occupancy', 'uncertainty', 'lane_mask', 'dir_x', 'dir_y']
+        arrays = [occ, unc, lane_mask, dir_x, dir_y]
         msg.layers = names
         msg.basic_layers = ['occupancy', 'uncertainty']
 

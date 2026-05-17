@@ -36,6 +36,7 @@ install(PROGRAMS
   scripts/tf_to_odom_node.py
   scripts/directional_planner_server.py
   scripts/map_loader_node.py
+  scripts/lane_editor.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

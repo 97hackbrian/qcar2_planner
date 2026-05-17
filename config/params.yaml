@@ -21,8 +21,11 @@ map_overlay_node:
     border_dilation_px: 0 # dilate PGM borders for better ICP matching
     pgm_scale_factor: 0.479 # Scale the image pixels when loading
     
+    # --- Lane Layer ---
+    lanes_yaml_path: ""  # set via launch arg or leave empty (auto-detects from map dir)
+    
     # --- Publishing ---
-    publish_rate: 0.5
+    publish_rate: 0.2
     map_frame: "map"
     
     # --- Output Topics ---
@@ -37,9 +40,17 @@ directional_planner_server:
     base_frame: "base_link" # robot heading frame (NOT odom!)
 
     # --- Planner ---
+    enforce_lane_mask: true
+    min_direction_dot: 0.4
     direction_penalty: 1.0e6
     occupancy_threshold: 0.5
     safety_margin_cells: 0 # 0 for loaded maps (narrow roads get blocked by inflation)
+
+    # --- Independent Lanes ---
+    use_independent_lanes: true
+    enforce_lane_successors: true
+    connection_threshold_m: 0.30
+    lanes_yaml_path: ""  # set via launch arg or auto-detect from config dir
 
     # --- Debug ---
     publish_path_markers: true
@@ -66,11 +77,14 @@ map_loader_node:
     # --- Map File ---
     map_yaml_path: "/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/map_ros.yaml" # set via launch arg
 
+    # --- Lane Layer ---
+    lanes_yaml_path: ""  # set via launch arg or leave empty (auto-detects from map dir)
+
     # --- Morphological Post-Processing ---
     morph_kernel_size: 0 # kernel for opening + closing
 
     # --- Publishing ---
-    publish_rate: 0.5
+    publish_rate: 0.2
     map_frame: "map"
 
     # --- Output Topics ---

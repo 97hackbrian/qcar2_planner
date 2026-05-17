@@ -1,0 +1,12 @@
+# lanes.example.yaml — Example format for config/lanes.yaml
+# DO NOT rename this to lanes.yaml unless you have real lane data.
+#
+# lanes:
+#   - name: "main_loop_cw"
+#     width: 0.15          # lane width in meters (pgm_map frame)
+#     points:              # ordered waypoints in pgm_map meters
+#       - [1.20, 0.85]
+#       - [2.10, 0.85]
+#       - [2.10, 1.50]
+#       - [1.20, 1.50]
+#       - [1.20, 0.85]    # close the loop if needed
