@@ -138,7 +138,7 @@ def generate_launch_description():
         qcar2_to_lidar_tf_node,
         cartographer_node,
         cartographer_occ_grid_node,
-        tf_to_odom_node,
+        #tf_to_odom_node,
         map_overlay_node,
         planner_server
     ])
