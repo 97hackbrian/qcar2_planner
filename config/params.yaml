@@ -22,7 +22,7 @@ map_overlay_node:
     pgm_scale_factor: 0.479 # Scale the image pixels when loading
     
     # --- Lane Layer ---
-    lanes_yaml_path: ""  # set via launch arg or leave empty (auto-detects from map dir)
+    lanes_yaml_path: "/workspaces/isaac_ros-dev/qcar2_maps/src/qcar2_planner/config/lanes.yaml"  # set via launch arg or leave empty (auto-detects from map dir)
     
     # --- Publishing ---
     publish_rate: 0.2
@@ -41,7 +41,7 @@ directional_planner_server:
 
     # --- Planner ---
     enforce_lane_mask: true
-    min_direction_dot: 0.6
+    min_direction_dot: 0.4
     direction_penalty: 1.0e6
     occupancy_threshold: 0.5
     safety_margin_cells: 0 # 0 for loaded maps (narrow roads get blocked by inflation)
