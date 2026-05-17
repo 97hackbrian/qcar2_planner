@@ -124,6 +124,7 @@ class MapOverlayNode(Node):
         self.declare_parameter('overlay_max_lidar_range_m', 6.0)
         self.declare_parameter('morph_kernel_size', 3)
         self.declare_parameter('border_dilation_px', 2)
+        self.declare_parameter('icp_min_wall_component_size', 25)
         self.declare_parameter('pgm_scale_factor', 0.495) # New scale factor parameter
         self.declare_parameter('publish_rate', 0.5)
         self.declare_parameter('map_frame', 'map')       # Cartographer frame
@@ -142,6 +143,7 @@ class MapOverlayNode(Node):
         self.overlay_max_lidar_range_m = float(self.get_parameter('overlay_max_lidar_range_m').value)
         self.morph_kernel_size = int(self.get_parameter('morph_kernel_size').value)
         self.border_dilation_px = int(self.get_parameter('border_dilation_px').value)
+        self.icp_min_wall_component_size = int(self.get_parameter('icp_min_wall_component_size').value)
         self.pgm_scale_factor = float(self.get_parameter('pgm_scale_factor').value)
         self.publish_rate = float(self.get_parameter('publish_rate').value)
         self.map_frame = str(self.get_parameter('map_frame').value)
@@ -290,6 +292,20 @@ class MapOverlayNode(Node):
 
         data = np.array(msg.data, dtype=np.int8).reshape((h, w))
         wall_mask = data >= 50
+
+        # Filter out tiny disconnected wall speckles caused by noisy /scan returns.
+        # This keeps the ICP input focused on real map structures.
+        if self.icp_min_wall_component_size > 1 and np.any(wall_mask):
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                wall_mask.astype(np.uint8), connectivity=8
+            )
+            cleaned = np.zeros_like(wall_mask)
+            for label in range(1, num_labels):
+                area = int(stats[label, cv2.CC_STAT_AREA])
+                if area >= self.icp_min_wall_component_size:
+                    cleaned[labels == label] = True
+            wall_mask = cleaned
+
         y_idx, x_idx = np.where(wall_mask)
         
         pts_x = ox + (x_idx + 0.5) * res
