@@ -41,7 +41,7 @@ directional_planner_server:
 
     # --- Planner ---
     enforce_lane_mask: true
-    min_direction_dot: 0.4
+    min_direction_dot: 0.6
     direction_penalty: 1.0e6
     occupancy_threshold: 0.5
     safety_margin_cells: 0 # 0 for loaded maps (narrow roads get blocked by inflation)
