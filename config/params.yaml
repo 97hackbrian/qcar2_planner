@@ -8,17 +8,17 @@ map_overlay_node:
     alignment_mode: "auto" # 'auto' (ICP) or 'manual' (/initialpose)
     
     # --- ICP Parameters ---
-    icp_max_iterations: 366
-    icp_convergence_threshold: 0.01
-    icp_max_correspondence_dist: 1.9
-    icp_downsample_resolution: 0.1
-    icp_min_cartographer_points: 200
+    icp_max_iterations: 9666
+    icp_convergence_threshold: 1.5
+    icp_max_correspondence_dist: 3.9
+    icp_downsample_resolution: 0.01
+    icp_min_cartographer_points: 50
     overlay_max_lidar_range_m: 6.0
     icp_min_wall_component_size: 90
     
     # --- Map Processing ---
     morph_kernel_size: 0
-    border_dilation_px: 0 # dilate PGM borders for better ICP matching
+    border_dilation_px: 2 # dilate PGM borders for better ICP matching
     pgm_scale_factor: 0.479 # Scale the image pixels when loading
     
     # --- Lane Layer ---
