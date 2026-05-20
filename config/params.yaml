@@ -8,13 +8,13 @@ map_overlay_node:
     alignment_mode: "auto" # 'auto' (ICP) or 'manual' (/initialpose)
     
     # --- ICP Parameters ---
-    icp_max_iterations: 9666
-    icp_convergence_threshold: 1.5
-    icp_max_correspondence_dist: 3.9
-    icp_downsample_resolution: 0.01
-    icp_min_cartographer_points: 50
-    overlay_max_lidar_range_m: 6.0
-    icp_min_wall_component_size: 90
+    icp_max_iterations: 9666 # Maximos intentos (iteraciones) para lograr alinear los mapas
+    icp_convergence_threshold: 1.5 # Tolerancia de precision: Si mejora menos que esto, asume que termino
+    icp_max_correspondence_dist: 3.9 # Distancia maxima (metros) para buscar la correspondencia de un punto
+    icp_downsample_resolution: 0.01 # Tamano (metros) para agrupar puntos y aligerar el calculo
+    icp_min_cartographer_points: 50 # Minimo de puntos de pared que Cartographer DEBE ver para arrancar
+    overlay_max_lidar_range_m: 6.0 # Radio maximo (metros) alrededor del robot que se usara para buscar paredes
+    icp_min_wall_component_size: 90 # Tamano minimo (en celdas) que debe tener una pared para ignorar basuritas
     
     # --- Map Processing ---
     morph_kernel_size: 0
@@ -40,19 +40,28 @@ directional_planner_server:
     base_frame: "base_link" # robot heading frame (NOT odom!)
 
     # --- Planner ---
+    # enforce_lane_mask: [true/false] Si es true, la busqueda A* solo es valida dentro de la mascara de carriles.
     enforce_lane_mask: true
+    # min_direction_dot: Alineacion (producto punto) requerida con el vector del carril. Subir: Exige mas paralelismo al carril (evita cruces bruscos). Bajar: Permite movimientos mas libres y cruces transversales.
     min_direction_dot: 0.4
+    # direction_penalty: Costo por ir en sentido contrario. Subir: Vuelve practicamente imposible ir contra el flujo. Bajar: Permite maniobras prohibidas si es la unica salida.
     direction_penalty: 1.0e6
+    # occupancy_threshold: Umbral para pared. Subir: Ignora sombras y manchas oscuras tenues. Bajar: Se vuelve cauteloso tomando cualquier sombra como obstaculo duro.
     occupancy_threshold: 0.5
-    safety_margin_cells: 0 # 0 for loaded maps (narrow roads get blocked by inflation)
+    # safety_margin_cells: Radio de inflacion alrededor de obstaculos. Subir: Aleja al coche de paredes (puede cerrar pasos estrechos). Bajar: Le permite pasar rozando paredes.
+    safety_margin_cells: 1 # 0 for loaded maps (narrow roads get blocked by inflation)
 
     # --- Independent Lanes ---
+    # use_independent_lanes: [true/false] Si es true, aisla el procesamiento por cada ID de carril para evitar brincos no deseados.
     use_independent_lanes: true
+    # enforce_lane_successors: [true/false] Exige que un salto de carril este explicitamente definido como valido en lanes.yaml.
     enforce_lane_successors: true
+    # connection_threshold_m: Tolerancia 0.3 (m) de distancia para saltar a un carril si no hay definicion en YAML. Subir: Permite encontrar atajos saltando a carriles lejanos. Bajar: Te encierra estrictamente en la trayectoria actual.
     connection_threshold_m: 0.30
     lanes_yaml_path: "/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/lanes.yaml"  # set via launch arg or auto-detect from config dir
 
     # --- Debug ---
+    # publish_path_markers: [true/false] Dibuja la ruta verde final en RViz.
     publish_path_markers: true
 
     # --- Goal Input (configurable topic) ---
@@ -61,15 +70,20 @@ directional_planner_server:
     # --- Semi-Goal Navigation ---
     mission_goals_topic: "/mission_goals"
     semi_goals_markers_topic: "/semi_goals_markers"
+    # semi_goal_spacing_m: Distancia entre puntos de la ruta que se envian a Nav2. Subir: Envias metas lejanas (movimiento mas rapido pero el coche traza sus propias curvas anchas). Bajar: Puntos muy juntos, el coche sigue la linea con exactitud quirurgica.
     semi_goal_spacing_m: 0.43
-    semi_goal_tolerance: 0.22
+    # semi_goal_tolerance: Precision con la que Nav2 debe atinar al punto antes de pasar al siguiente. Subir: Movimiento ininterrumpido (pasa "cerca" y avanza). Bajar: El coche se frena intentando cuadrarse exacto en cada punto.
+    semi_goal_tolerance: 0.26
 
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
 
     # --- Ackermann Constraints ---
+    # max_turn_angle_deg: Limite maximo de giro (steering) que el planificador cree que puede dar. Subir: Planea curvas cerradas (que el hardware real podria no dar). Bajar: Solo entrega rutas muy suaves.
     max_turn_angle_deg: 49.0 # max turn angle (>120° = hard-blocked)
+    # right_bias_penalty: Que tan fuerte se castiga ir por la izquierda. Subir: Se pega agresivamente al borde derecho del carril. Bajar: Ignora la derecha y viaja por el centro exacto.
     right_bias_penalty: 0.15 # gradient-based right wall attraction strength 0.9
+    # forward_lock_cells: Bloqueo de inicio. Celdas obligatorias en linea recta al empezar. Subir: Arranca derecho mucho tramo antes de dar vuelta. Bajar: Volantea abruptamente desde la celda de inicio.
     forward_lock_cells: 45 # strict 90° forward within this radius (cells from start)
 
 map_loader_node:
