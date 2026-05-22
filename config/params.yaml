@@ -112,6 +112,19 @@ directional_planner_server:
     no_right_boundary_check_step_m: 0.02
     max_no_boundary_opening_reduction_ratio: 0.65
 
+    # --- Post-Curve Straight Counteroffset ---
+    use_post_curve_straight_counteroffset: true
+    post_curve_counteroffset_m: 0.05
+    post_curve_counteroffset_max_m: 0.10
+    post_curve_counteroffset_distance_m: 0.70
+    post_curve_counteroffset_ramp_in_m: 0.15
+    post_curve_counteroffset_ramp_out_m: 0.25
+    post_curve_straight_angle_threshold_deg: 6.0
+    post_curve_min_total_angle_deg: 12.0
+    post_curve_right_boundary_trigger_m: 0.22
+    post_curve_counteroffset_check_step_m: 0.02
+    post_curve_counteroffset_direction: "left"
+
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
 

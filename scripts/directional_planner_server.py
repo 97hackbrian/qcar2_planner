@@ -512,13 +512,25 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('right_boundary_check_step_m', 0.02)
         self.declare_parameter('minimum_opening_if_no_right_boundary_deg', 0.0)
 
-        self.declare_parameter('use_no_right_boundary_curve_tightening', False)
-        self.declare_parameter('no_right_boundary_tightening_gain', 0.35)
+        self.declare_parameter('use_no_right_boundary_curve_tightening', True)
+        self.declare_parameter('no_right_boundary_tightening_gain', 0.55)
         self.declare_parameter('no_right_boundary_near_m', 0.12)
-        self.declare_parameter('no_right_boundary_far_m', 0.35)
+        self.declare_parameter('no_right_boundary_far_m', 0.30)
         self.declare_parameter('no_right_boundary_check_distance_m', 0.45)
         self.declare_parameter('no_right_boundary_check_step_m', 0.02)
-        self.declare_parameter('max_no_boundary_opening_reduction_ratio', 0.50)
+        self.declare_parameter('max_no_boundary_opening_reduction_ratio', 0.65)
+
+        self.declare_parameter('use_post_curve_straight_counteroffset', False)
+        self.declare_parameter('post_curve_counteroffset_m', 0.05)
+        self.declare_parameter('post_curve_counteroffset_max_m', 0.10)
+        self.declare_parameter('post_curve_counteroffset_distance_m', 0.70)
+        self.declare_parameter('post_curve_counteroffset_ramp_in_m', 0.15)
+        self.declare_parameter('post_curve_counteroffset_ramp_out_m', 0.25)
+        self.declare_parameter('post_curve_straight_angle_threshold_deg', 6.0)
+        self.declare_parameter('post_curve_min_total_angle_deg', 12.0)
+        self.declare_parameter('post_curve_right_boundary_trigger_m', 0.22)
+        self.declare_parameter('post_curve_counteroffset_check_step_m', 0.02)
+        self.declare_parameter('post_curve_counteroffset_direction', 'left')
 
         # Edge Clearance Cost (optional soft penalty near lane edges)
         self.declare_parameter('use_edge_clearance_cost', False)
@@ -626,6 +638,18 @@ class DirectionalPlannerServer(Node):
         self.no_right_boundary_check_distance_m = float(self.get_parameter('no_right_boundary_check_distance_m').value)
         self.no_right_boundary_check_step_m = float(self.get_parameter('no_right_boundary_check_step_m').value)
         self.max_no_boundary_opening_reduction_ratio = float(self.get_parameter('max_no_boundary_opening_reduction_ratio').value)
+
+        self.use_post_curve_straight_counteroffset = bool(self.get_parameter('use_post_curve_straight_counteroffset').value)
+        self.post_curve_counteroffset_m = float(self.get_parameter('post_curve_counteroffset_m').value)
+        self.post_curve_counteroffset_max_m = float(self.get_parameter('post_curve_counteroffset_max_m').value)
+        self.post_curve_counteroffset_distance_m = float(self.get_parameter('post_curve_counteroffset_distance_m').value)
+        self.post_curve_counteroffset_ramp_in_m = float(self.get_parameter('post_curve_counteroffset_ramp_in_m').value)
+        self.post_curve_counteroffset_ramp_out_m = float(self.get_parameter('post_curve_counteroffset_ramp_out_m').value)
+        self.post_curve_straight_angle_threshold_deg = float(self.get_parameter('post_curve_straight_angle_threshold_deg').value)
+        self.post_curve_min_total_angle_deg = float(self.get_parameter('post_curve_min_total_angle_deg').value)
+        self.post_curve_right_boundary_trigger_m = float(self.get_parameter('post_curve_right_boundary_trigger_m').value)
+        self.post_curve_counteroffset_check_step_m = float(self.get_parameter('post_curve_counteroffset_check_step_m').value)
+        self.post_curve_counteroffset_direction = str(self.get_parameter('post_curve_counteroffset_direction').value)
 
         # Edge Clearance Cost
         self.use_edge_clearance_cost = bool(self.get_parameter('use_edge_clearance_cost').value)
@@ -2319,6 +2343,10 @@ class DirectionalPlannerServer(Node):
         if getattr(self, 'use_ackermann_curve_yaw_offset', False):
             self._apply_ackermann_curve_yaw_offset()
 
+        # ── Post-Curve Straight Counteroffset ───────────────────────────
+        if getattr(self, 'use_post_curve_straight_counteroffset', False):
+            self._apply_post_curve_straight_counteroffset()
+
         # ── Yaw Validation & Repair (final stage) ───────────────────────
         if getattr(self, 'use_semigoal_yaw_validation', False):
             self._validate_and_repair_semigoal_yaws()
@@ -2672,6 +2700,170 @@ class DirectionalPlannerServer(Node):
             f'[ACKERMANN_YAW] Analyzed {N} semi-goals. Modified {modified_count} across {len(blocks)} curves. '
             f'Params -> max_deg={max_deg}, min_deg={min_deg}, rate_limit={rate_limit}. '
             f'use_no_right_boundary_curve_tightening={getattr(self, "use_no_right_boundary_curve_tightening", False)}'
+        )
+
+    # =====================================================================
+    # Post-Curve Straight Counteroffset
+    # =====================================================================
+    def _apply_post_curve_straight_counteroffset(self):
+        """
+        Applies a lateral counteroffset to semi-goals located in straight
+        segments immediately following a curve, to avoid hugging the right boundary.
+        """
+        N = len(self.semi_goals)
+        if N < 5:
+            return
+
+        headings = np.zeros(N - 1, dtype=np.float64)
+        for j in range(N - 1):
+            sx, sy, _ = self.semi_goals[j]
+            nx, ny, _ = self.semi_goals[j + 1]
+            headings[j] = math.atan2(ny - sy, nx - sx)
+
+        deltas = np.zeros(N - 2, dtype=np.float64)
+        for j in range(N - 2):
+            diff = headings[j + 1] - headings[j]
+            deltas[j] = self._normalize_angle(diff)
+
+        # Detect curves and straight zones
+        curve_types = np.zeros(N, dtype=np.int32)
+        window = getattr(self, 'curve_detection_window', 5)
+        min_consec = getattr(self, 'curve_min_consecutive_angle_changes', 3)
+        total_min = math.radians(self.post_curve_min_total_angle_deg)
+        straight_thresh = math.radians(self.post_curve_straight_angle_threshold_deg)
+
+        i = 0
+        while i < len(deltas) - window:
+            window_slice = deltas[i:i+window]
+            abs_slice = np.abs(window_slice)
+            
+            consecutive = 0
+            longest = []
+            current = []
+            for d in window_slice:
+                if abs(d) > 0.01:
+                    current.append(d)
+                    consecutive += 1
+                else:
+                    if consecutive > len(longest):
+                        longest = current
+                    consecutive = 0
+                    current = []
+            if consecutive > len(longest):
+                longest = current
+                
+            if len(longest) >= min_consec and float(np.sum(np.abs(longest))) >= total_min:
+                curve_types[i:i+window] = 1
+            i += 1
+
+        # Fill curve gaps and identify ends of curves
+        in_curve = False
+        curve_ends = []
+        for j in range(N):
+            if curve_types[j] == 1:
+                in_curve = True
+            elif in_curve:
+                # Check if it's really a straight now
+                is_straight = True
+                check_len = min(3, N - 2 - j)
+                if check_len > 0:
+                    for k in range(j, j + check_len):
+                        if abs(deltas[k]) >= straight_thresh:
+                            is_straight = False
+                            break
+                if is_straight:
+                    in_curve = False
+                    curve_ends.append(j)
+                else:
+                    curve_types[j] = 1 # extend curve
+
+        if not curve_ends:
+            return
+
+        modified_count = 0
+        rejected_lane_safe = 0
+        rejected_no_boundary = 0
+        max_dist = self.post_curve_counteroffset_distance_m
+        offset_target = self.post_curve_counteroffset_m
+        offset_max = self.post_curve_counteroffset_max_m
+        ramp_in = self.post_curve_counteroffset_ramp_in_m
+        ramp_out = self.post_curve_counteroffset_ramp_out_m
+        boundary_trigger = self.post_curve_right_boundary_trigger_m
+        
+        def _dist(a, b):
+            return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+        for end_idx in curve_ends:
+            straight_dist = 0.0
+            for j in range(end_idx, N - 1):
+                if j == N - 1:
+                    break # Skip exact final goal
+                if curve_types[j] == 1:
+                    break # Hit another curve
+                    
+                pt = self.semi_goals[j]
+                if j > end_idx:
+                    straight_dist += _dist(self.semi_goals[j-1], pt)
+                    
+                if straight_dist > max_dist:
+                    break
+                    
+                # Calculate ramp
+                ramp_factor = 1.0
+                if straight_dist < ramp_in and ramp_in > 0:
+                    ramp_factor = straight_dist / ramp_in
+                elif straight_dist > (max_dist - ramp_out) and ramp_out > 0:
+                    ramp_factor = (max_dist - straight_dist) / ramp_out
+                    
+                ramp_factor = max(0.0, min(1.0, ramp_factor))
+                if ramp_factor <= 0.01:
+                    continue
+
+                mag = min(offset_target * ramp_factor, offset_max)
+                
+                # Check right boundary
+                yaw_base = headings[j] if j < len(headings) else pt[2]
+                clearance = self._get_right_clearance(
+                    pt[0], pt[1], yaw_base,
+                    max_dist=boundary_trigger + 0.1,
+                    step=self.post_curve_counteroffset_check_step_m
+                )
+                
+                if clearance > boundary_trigger:
+                    rejected_no_boundary += 1
+                    continue
+                    
+                # Apply offset
+                if self.post_curve_counteroffset_direction == "left":
+                    ox = -math.sin(yaw_base) * mag
+                    oy = math.cos(yaw_base) * mag
+                else:
+                    ox = -math.sin(yaw_base) * mag
+                    oy = math.cos(yaw_base) * mag
+                    
+                new_x = pt[0] + ox
+                new_y = pt[1] + oy
+                
+                # Verify lane-safe
+                safe = True
+                if j > 0:
+                    prev = self.semi_goals[j-1]
+                    safe = safe and self._is_segment_lane_safe(prev[0], prev[1], new_x, new_y, step=0.02)
+                if j < N - 1:
+                    nxt = self.semi_goals[j+1]
+                    safe = safe and self._is_segment_lane_safe(new_x, new_y, nxt[0], nxt[1], step=0.02)
+                    
+                if safe:
+                    self.semi_goals[j] = (new_x, new_y, pt[2])
+                    modified_count += 1
+                else:
+                    rejected_lane_safe += 1
+
+        self.get_logger().info(
+            f'[POST_CURVE_OFFSET] curves_detected={len(curve_ends)}, '
+            f'modified_points={modified_count}, '
+            f'rejected_safe={rejected_lane_safe}, '
+            f'rejected_no_boundary={rejected_no_boundary}'
         )
 
     # =====================================================================

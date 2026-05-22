@@ -31,7 +31,7 @@ options = {
 MAP_BUILDER.use_trajectory_builder_2d = true
 
 -- ── Trajectory builder tuning ──────────────────────────────────
-TRAJECTORY_BUILDER_2D.min_range = 0.10
+TRAJECTORY_BUILDER_2D.min_range = 0.23
 TRAJECTORY_BUILDER_2D.max_range = 9.0
 TRAJECTORY_BUILDER_2D.missing_data_ray_length = 4.
 TRAJECTORY_BUILDER_2D.use_imu_data = true    -- ENABLE IMU FUSION
