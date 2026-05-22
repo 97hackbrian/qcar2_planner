@@ -99,6 +99,8 @@ def _astar_core_python(
     lane_masks_3d,        # float32 [N, rows, cols] — per-lane masks (empty if GLOBAL)
     lane_dir_x_3d,        # float32 [N, rows, cols]
     lane_dir_y_3d,        # float32 [N, rows, cols]
+    edge_clearance_3d,    # float32 [N, rows, cols] — per-lane edge clearance cost
+    curve_inner_3d,       # float32 [N, rows, cols] — per-lane curve inner cost
     successor_matrix,     # int8    [N, N]
     start_lane_ids,       # int32   [S]  — lane ids for start cell
     sc, sr, gc, gr,       # int32 scalars
@@ -111,6 +113,10 @@ def _astar_core_python(
     lock_radius_sq,       # int32
     enforce_lane_mask,    # bool
     enforce_lane_successors,  # bool
+    use_edge_clearance,   # bool
+    edge_clearance_weight,# float64
+    use_curve_clearance,  # bool
+    curve_clearance_weight,# float64
     rows, cols,           # int32
 ):
     """
@@ -382,6 +388,16 @@ def _astar_core_python(
                     if dot_lane < 0.0:
                         penalty += direction_penalty
 
+                # ── Edge clearance penalty (optional) ───────────────
+                if use_edge_clearance and n_slot < n_lanes:
+                    ec_val = float(edge_clearance_3d[n_slot, nr, nc])
+                    penalty += edge_clearance_weight * ec_val
+
+                # ── Curve inner clearance penalty (optional) ────────
+                if use_curve_clearance and n_slot < n_lanes:
+                    cc_val = float(curve_inner_3d[n_slot, nr, nc])
+                    penalty += curve_clearance_weight * cc_val
+
                 edge_cost = step_dist * resolution + penalty
                 tentative_g = g_score[cr, cc, c_slot] + edge_cost
 
@@ -469,6 +485,51 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('connection_threshold_m', 0.30)
         self.declare_parameter('lanes_yaml_path', '')
 
+        # Adaptive Semi-Goal Spacing
+        self.declare_parameter('use_adaptive_semigoal_spacing', False)
+        self.declare_parameter('straight_semigoal_spacing_m', 0.30)
+        self.declare_parameter('curve_semigoal_spacing_m', 0.18)
+        self.declare_parameter('curve_spacing_angle_threshold_deg', 15.0)
+
+        # Curve Yaw Opening
+        self.declare_parameter('use_curve_yaw_opening', False)
+        self.declare_parameter('curve_yaw_window_size', 5)
+        self.declare_parameter('curve_min_consecutive_changes', 3)
+        self.declare_parameter('curve_delta_angle_min_deg', 5.0)
+        self.declare_parameter('curve_delta_angle_std_max_deg', 8.0)
+        self.declare_parameter('curve_total_angle_min_deg', 15.0)
+        self.declare_parameter('curve_opening_yaw_deg', 12.0)
+        self.declare_parameter('curve_opening_yaw_max_deg', 20.0)
+        self.declare_parameter('curve_anticipation_points', 2)
+
+        # Edge Clearance Cost (optional soft penalty near lane edges)
+        self.declare_parameter('use_edge_clearance_cost', False)
+        self.declare_parameter('edge_clearance_weight', 0.08)
+        self.declare_parameter('min_clearance_to_lane_edge_m', 0.12)
+
+        # Curve Inner Clearance Cost (optional penalty near inner edges of curves)
+        self.declare_parameter('use_curve_clearance_cost', False)
+        self.declare_parameter('curve_clearance_weight', 0.10)
+        self.declare_parameter('curve_angle_threshold_deg', 20.0)
+        self.declare_parameter('curve_inner_clearance_m', 0.15)
+
+        # Path Postprocessing (optional path cleanup before semi-goal generation)
+        self.declare_parameter('use_path_postprocessing', False)
+        self.declare_parameter('path_smoothing_window', 5)
+        self.declare_parameter('path_prune_collinear_tolerance_m', 0.03)
+        self.declare_parameter('max_smoothing_shift_m', 0.20)
+
+        # Semi-goal zigzag cleanup (optional local correction of zigzag semi-goals)
+        self.declare_parameter('use_semigoal_zigzag_cleanup', False)
+        self.declare_parameter('prefer_zigzag_correction_over_deletion', True)
+        self.declare_parameter('max_semigoal_deletions_per_path', 2)
+        self.declare_parameter('min_semigoals_to_keep', 5)
+        self.declare_parameter('max_direct_segment_after_deletion_m', 0.35)
+        self.declare_parameter('zigzag_angle_threshold_deg', 30.0)
+        self.declare_parameter('zigzag_lateral_threshold_m', 0.05)
+        self.declare_parameter('max_zigzag_fix_shift_m', 0.12)
+        self.declare_parameter('semigoal_segment_check_step_m', 0.02)
+
         # ── Read parameters ─────────────────────────────────────────────────
         self.direction_penalty = self.get_parameter('direction_penalty').value
         self.occ_threshold = self.get_parameter('occupancy_threshold').value
@@ -492,6 +553,29 @@ class DirectionalPlannerServer(Node):
         self.use_independent_lanes = bool(self.get_parameter('use_independent_lanes').value)
         self.enforce_lane_successors = bool(self.get_parameter('enforce_lane_successors').value)
         self.connection_threshold_m = float(self.get_parameter('connection_threshold_m').value)
+
+        # Adaptive Semi-Goal Spacing
+        self.use_adaptive_semigoal_spacing = bool(self.get_parameter('use_adaptive_semigoal_spacing').value)
+        self.straight_semigoal_spacing_m = float(self.get_parameter('straight_semigoal_spacing_m').value)
+        self.curve_semigoal_spacing_m = float(self.get_parameter('curve_semigoal_spacing_m').value)
+        self.curve_spacing_angle_threshold_deg = float(self.get_parameter('curve_spacing_angle_threshold_deg').value)
+
+        # Curve Yaw Opening
+        self.use_curve_yaw_opening = bool(self.get_parameter('use_curve_yaw_opening').value)
+        self.curve_yaw_window_size = int(self.get_parameter('curve_yaw_window_size').value)
+        self.curve_min_consecutive_changes = int(self.get_parameter('curve_min_consecutive_changes').value)
+        self.curve_delta_angle_min_deg = float(self.get_parameter('curve_delta_angle_min_deg').value)
+        self.curve_delta_angle_std_max_deg = float(self.get_parameter('curve_delta_angle_std_max_deg').value)
+        self.curve_total_angle_min_deg = float(self.get_parameter('curve_total_angle_min_deg').value)
+        self.curve_opening_yaw_deg = float(self.get_parameter('curve_opening_yaw_deg').value)
+        self.curve_opening_yaw_max_deg = float(self.get_parameter('curve_opening_yaw_max_deg').value)
+        self.curve_anticipation_points = int(self.get_parameter('curve_anticipation_points').value)
+
+        # Edge Clearance Cost
+        self.use_edge_clearance_cost = bool(self.get_parameter('use_edge_clearance_cost').value)
+        self.edge_clearance_weight = float(self.get_parameter('edge_clearance_weight').value)
+        self.min_clearance_to_lane_edge_m = float(self.get_parameter('min_clearance_to_lane_edge_m').value)
+
         raw_lanes_path = str(self.get_parameter('lanes_yaml_path').value)
         self.lanes_yaml_path = os.path.abspath(
             os.path.expanduser(
@@ -506,6 +590,65 @@ class DirectionalPlannerServer(Node):
             f'Ackermann: max_turn={max_turn_deg}° (cos={self.max_turn_cos:.3f}), '
             f'right_bias={self.right_bias_penalty}, '
             f'forward_lock={self.forward_lock_cells} cells'
+        )
+
+        # Edge clearance log
+        ec_state = 'ACTIVE' if self.use_edge_clearance_cost else 'INACTIVE'
+        self.get_logger().info(
+            f'[EDGE_CLEARANCE] {ec_state}: '
+            f'weight={self.edge_clearance_weight}, '
+            f'min_clearance={self.min_clearance_to_lane_edge_m}m'
+        )
+
+        # Curve clearance parameters
+        self.use_curve_clearance_cost = bool(self.get_parameter('use_curve_clearance_cost').value)
+        self.curve_clearance_weight = float(self.get_parameter('curve_clearance_weight').value)
+        self.curve_angle_threshold_deg = float(self.get_parameter('curve_angle_threshold_deg').value)
+        self.curve_inner_clearance_m = float(self.get_parameter('curve_inner_clearance_m').value)
+
+        cc_state = 'ACTIVE' if self.use_curve_clearance_cost else 'INACTIVE'
+        self.get_logger().info(
+            f'[CURVE_CLEARANCE] {cc_state}: '
+            f'weight={self.curve_clearance_weight}, '
+            f'angle_thresh={self.curve_angle_threshold_deg}°, '
+            f'inner_clearance={self.curve_inner_clearance_m}m'
+        )
+
+        # Path Postprocessing
+        self.use_path_postprocessing = bool(self.get_parameter('use_path_postprocessing').value)
+        self.path_smoothing_window = int(self.get_parameter('path_smoothing_window').value)
+        self.path_prune_collinear_tolerance_m = float(self.get_parameter('path_prune_collinear_tolerance_m').value)
+        self.max_smoothing_shift_m = float(self.get_parameter('max_smoothing_shift_m').value)
+
+        pp_state = 'ACTIVE' if self.use_path_postprocessing else 'INACTIVE'
+        self.get_logger().info(
+            f'[PATH_POSTPROCESS] {pp_state}: '
+            f'smoothing_window={self.path_smoothing_window}, '
+            f'collinear_tol={self.path_prune_collinear_tolerance_m}m, '
+            f'max_shift={self.max_smoothing_shift_m}m'
+        )
+
+        # Semi-goal zigzag cleanup
+        self.use_semigoal_zigzag_cleanup = bool(self.get_parameter('use_semigoal_zigzag_cleanup').value)
+        self.prefer_zigzag_correction_over_deletion = bool(self.get_parameter('prefer_zigzag_correction_over_deletion').value)
+        self.max_semigoal_deletions_per_path = int(self.get_parameter('max_semigoal_deletions_per_path').value)
+        self.min_semigoals_to_keep = int(self.get_parameter('min_semigoals_to_keep').value)
+        self.max_direct_segment_after_deletion_m = float(self.get_parameter('max_direct_segment_after_deletion_m').value)
+        self.zigzag_angle_threshold_deg = float(self.get_parameter('zigzag_angle_threshold_deg').value)
+        self.zigzag_lateral_threshold_m = float(self.get_parameter('zigzag_lateral_threshold_m').value)
+        self.max_zigzag_fix_shift_m = float(self.get_parameter('max_zigzag_fix_shift_m').value)
+        self.semigoal_segment_check_step_m = float(self.get_parameter('semigoal_segment_check_step_m').value)
+
+        zz_state = 'ACTIVE' if self.use_semigoal_zigzag_cleanup else 'INACTIVE'
+        self.get_logger().info(
+            f'[ZIGZAG_CLEANUP] {zz_state}: '
+            f'prefer_corr={self.prefer_zigzag_correction_over_deletion}, '
+            f'max_del={self.max_semigoal_deletions_per_path}, '
+            f'min_keep={self.min_semigoals_to_keep}, '
+            f'angle_thresh={self.zigzag_angle_threshold_deg}°, '
+            f'lateral_thresh={self.zigzag_lateral_threshold_m}m, '
+            f'max_shift={self.max_zigzag_fix_shift_m}m, '
+            f'check_step={self.semigoal_segment_check_step_m}m'
         )
 
         # ── State ───────────────────────────────────────────────────────────
@@ -765,7 +908,214 @@ class DirectionalPlannerServer(Node):
                 self.get_logger().info(f"{lane['id']} successors: {succ_list}")
                 
         self.get_logger().info(f'Connections: {manual_conn} manual, {auto_conn} automatic.')
+
+        # 3) Compute edge clearance cost for each lane (optional)
+        if self.use_edge_clearance_cost:
+            self._compute_edge_clearance_cost(parsed_lanes, res)
+        else:
+            self.get_logger().info('[EDGE_CLEARANCE] Disabled — skipping edge clearance computation.')
+
+        # 4) Compute curve inner clearance cost for each lane (optional)
+        if self.use_curve_clearance_cost:
+            self._compute_curve_inner_cost(parsed_lanes, res)
+        else:
+            self.get_logger().info('[CURVE_CLEARANCE] Disabled — skipping curve clearance computation.')
+
         self.lanes_loaded = True
+
+    # =====================================================================
+    # Compute edge clearance cost per independent lane
+    # =====================================================================
+    def _compute_edge_clearance_cost(self, parsed_lanes, resolution):
+        """
+        For each lane, compute a soft penalty grid based on distance to the
+        lane mask edge.  Cells close to the edge get high cost (up to 1.0),
+        cells far from the edge get 0 cost.
+
+        Uses cv2.distanceTransform on the binary lane mask.
+        Cost = max(0, 1 - dist_m / min_clearance_to_lane_edge_m)
+        """
+        import cv2
+
+        min_clearance_m = self.min_clearance_to_lane_edge_m
+        if min_clearance_m <= 0.0:
+            self.get_logger().warn(
+                '[EDGE_CLEARANCE] min_clearance_to_lane_edge_m <= 0 — '
+                'disabling edge clearance cost.'
+            )
+            return
+
+        self.get_logger().info(
+            f'[EDGE_CLEARANCE] Computing edge clearance cost for '
+            f'{len(parsed_lanes)} lanes (min_clearance={min_clearance_m}m, '
+            f'resolution={resolution}m/px)...'
+        )
+
+        for lane in parsed_lanes:
+            mask = lane['mask']
+            # Binary mask: 1 where lane is valid, 0 elsewhere
+            binary_mask = (mask > 0.5).astype(np.uint8)
+
+            # Distance transform: distance from each foreground pixel to
+            # nearest background pixel (= lane edge)
+            dist_px = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
+            dist_m = dist_px.astype(np.float32) * resolution
+
+            # Cost: 1.0 at edge, linearly decays to 0.0 at min_clearance_m
+            # cost = max(0, 1 - dist_m / min_clearance_m)
+            edge_cost = np.clip(1.0 - dist_m / min_clearance_m, 0.0, 1.0)
+
+            # Zero out cost outside the lane mask (safety — should already be
+            # blocked by mask, but be defensive)
+            edge_cost[binary_mask == 0] = 0.0
+
+            lane['edge_clearance_cost'] = edge_cost.astype(np.float32)
+
+            # Store in lane_grids too
+            lid = lane['id']
+            if lid in self.lane_grids:
+                self.lane_grids[lid]['edge_clearance_cost'] = edge_cost.astype(np.float32)
+
+            # Log stats
+            valid_costs = edge_cost[binary_mask > 0]
+            if valid_costs.size > 0:
+                self.get_logger().info(
+                    f'[EDGE_CLEARANCE] {lid} ({lane["name"]}): '
+                    f'min_cost={float(valid_costs.min()):.4f}, '
+                    f'max_cost={float(valid_costs.max()):.4f}, '
+                    f'mean_cost={float(valid_costs.mean()):.4f}, '
+                    f'penalized_cells={int(np.sum(valid_costs > 0))}'
+                )
+            else:
+                self.get_logger().warn(
+                    f'[EDGE_CLEARANCE] {lid} ({lane["name"]}): '
+                    f'no valid cells in mask!'
+                )
+
+        self.get_logger().info('[EDGE_CLEARANCE] Edge clearance cost computation complete.')
+
+    # =====================================================================
+    # Compute curve inner clearance cost per independent lane
+    # =====================================================================
+    def _compute_curve_inner_cost(self, parsed_lanes, resolution):
+        """
+        For each lane, detect curves (angle > threshold) and compute a soft penalty
+        grid based on distance to the inner edge of the curve.
+        """
+        import cv2
+
+        angle_thresh_rad = math.radians(self.curve_angle_threshold_deg)
+        inner_clearance_m = self.curve_inner_clearance_m
+
+        if inner_clearance_m <= 0.0:
+            self.get_logger().warn(
+                '[CURVE_CLEARANCE] curve_inner_clearance_m <= 0 — disabling curve cost.'
+            )
+            return
+
+        self.get_logger().info(
+            f'[CURVE_CLEARANCE] Computing curve inner cost for '
+            f'{len(parsed_lanes)} lanes (inner_clearance={inner_clearance_m}m, '
+            f'angle_thresh={self.curve_angle_threshold_deg}°)...'
+        )
+
+        origin_x = self.map_info.pose.position.x - self.map_info.length_x / 2.0
+        origin_y = self.map_info.pose.position.y - self.map_info.length_y / 2.0
+
+        for lane in parsed_lanes:
+            pts = lane['points']
+            width = float(lane.get('width', 0.0))
+            if len(pts) < 3 or width <= 0.0:
+                curve_cost = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
+                lane['curve_inner_cost'] = curve_cost
+                if lane['id'] in self.lane_grids:
+                    self.lane_grids[lane['id']]['curve_inner_cost'] = curve_cost
+                continue
+
+            inner_edge_mask = np.zeros((self.grid_rows, self.grid_cols), dtype=np.uint8)
+            curve_segments_count = 0
+
+            for i in range(1, len(pts) - 1):
+                p1 = pts[i - 1]
+                p2 = pts[i]
+                p3 = pts[i + 1]
+
+                v1x = p2[0] - p1[0]
+                v1y = p2[1] - p1[1]
+                v2x = p3[0] - p2[0]
+                v2y = p3[1] - p2[1]
+
+                mag1 = math.sqrt(v1x * v1x + v1y * v1y)
+                mag2 = math.sqrt(v2x * v2x + v2y * v2y)
+
+                if mag1 < 1e-6 or mag2 < 1e-6:
+                    continue
+
+                v1x /= mag1; v1y /= mag1
+                v2x /= mag2; v2y /= mag2
+
+                dot = v1x * v2x + v1y * v2y
+                dot = max(-1.0, min(1.0, dot))
+                angle = math.acos(dot)
+
+                if angle > angle_thresh_rad:
+                    # Curve detected. Find inner side via cross product
+                    cross = v1x * v2y - v1y * v2x
+                    # If cross > 0 (left turn), inner is on the left
+                    if cross > 0:
+                        n1x, n1y = -v1y, v1x
+                        n2x, n2y = -v2y, v2x
+                    else:
+                        n1x, n1y = v1y, -v1x
+                        n2x, n2y = v2y, -v2x
+
+                    # Inner edge points for segment 1 (p1 -> p2)
+                    ie1_p1 = (p1[0] + n1x * (width / 2.0), p1[1] + n1y * (width / 2.0))
+                    ie1_p2 = (p2[0] + n1x * (width / 2.0), p2[1] + n1y * (width / 2.0))
+
+                    # Inner edge points for segment 2 (p2 -> p3)
+                    ie2_p1 = (p2[0] + n2x * (width / 2.0), p2[1] + n2y * (width / 2.0))
+                    ie2_p2 = (p3[0] + n2x * (width / 2.0), p3[1] + n2y * (width / 2.0))
+
+                    def w2g(p):
+                        c = int((p[0] - origin_x) / resolution - 0.5)
+                        r = int((p[1] - origin_y) / resolution - 0.5)
+                        return (c, r)
+
+                    c1_1, r1_1 = w2g(ie1_p1)
+                    c1_2, r1_2 = w2g(ie1_p2)
+                    c2_1, r2_1 = w2g(ie2_p1)
+                    c2_2, r2_2 = w2g(ie2_p2)
+
+                    cv2.line(inner_edge_mask, (c1_1, r1_1), (c1_2, r1_2), 1, 1)
+                    cv2.line(inner_edge_mask, (c2_1, r2_1), (c2_2, r2_2), 1, 1)
+                    curve_segments_count += 1
+
+            if curve_segments_count > 0:
+                dist_px = cv2.distanceTransform(1 - inner_edge_mask, cv2.DIST_L2, 5)
+                dist_m = dist_px.astype(np.float32) * resolution
+                # Cost: 1.0 at edge, linearly decays to 0.0 at inner_clearance_m
+                curve_cost = np.clip(1.0 - dist_m / inner_clearance_m, 0.0, 1.0)
+                # Apply lane mask
+                binary_lane_mask = (lane['mask'] > 0.5).astype(np.float32)
+                curve_cost = curve_cost * binary_lane_mask
+            else:
+                curve_cost = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
+
+            lane['curve_inner_cost'] = curve_cost
+            if lane['id'] in self.lane_grids:
+                self.lane_grids[lane['id']]['curve_inner_cost'] = curve_cost
+
+            # Log stats
+            valid_costs = curve_cost[curve_cost > 0]
+            if curve_segments_count > 0:
+                self.get_logger().info(
+                    f'[CURVE_CLEARANCE] {lane["id"]} ({lane["name"]}): '
+                    f'{curve_segments_count} curve segments, '
+                    f'penalized_cells={int(np.sum(curve_cost > 0))}'
+                )
+
+        self.get_logger().info('[CURVE_CLEARANCE] Curve inner clearance cost computation complete.')
 
     # =====================================================================
     # Enable/disable service
@@ -969,14 +1319,34 @@ class DirectionalPlannerServer(Node):
             lane_masks_3d = np.zeros((n_lanes, rows, cols), dtype=np.float32)
             lane_dir_x_3d = np.zeros((n_lanes, rows, cols), dtype=np.float32)
             lane_dir_y_3d = np.zeros((n_lanes, rows, cols), dtype=np.float32)
+            edge_clearance_3d = np.zeros((n_lanes, rows, cols), dtype=np.float32)
+            curve_inner_3d = np.zeros((n_lanes, rows, cols), dtype=np.float32)
             for lid, idx in lane_id_map.items():
                 lane_masks_3d[idx] = self.lane_grids[lid]['mask']
                 lane_dir_x_3d[idx] = self.lane_grids[lid]['dir_x']
                 lane_dir_y_3d[idx] = self.lane_grids[lid]['dir_y']
+                # Fallback-safe: only copy if precomputed
+                if 'edge_clearance_cost' in self.lane_grids[lid]:
+                    edge_clearance_3d[idx] = self.lane_grids[lid]['edge_clearance_cost']
+                if 'curve_inner_cost' in self.lane_grids[lid]:
+                    curve_inner_3d[idx] = self.lane_grids[lid]['curve_inner_cost']
         else:
             lane_masks_3d = np.zeros((0, rows, cols), dtype=np.float32)
             lane_dir_x_3d = np.zeros((0, rows, cols), dtype=np.float32)
             lane_dir_y_3d = np.zeros((0, rows, cols), dtype=np.float32)
+            edge_clearance_3d = np.zeros((0, rows, cols), dtype=np.float32)
+            curve_inner_3d = np.zeros((0, rows, cols), dtype=np.float32)
+
+        # Resolve effective edge clearance state for this A* call
+        use_ec = self.use_edge_clearance_cost and n_lanes > 0
+        ec_weight = self.edge_clearance_weight if use_ec else 0.0
+        if use_ec:
+            self.get_logger().info(
+                f'[A*] Edge clearance cost ACTIVE (weight={ec_weight}, '
+                f'min_clearance={self.min_clearance_to_lane_edge_m}m)'
+            )
+        else:
+            self.get_logger().info('[A*] Edge clearance cost INACTIVE — no extra penalty applied.')
 
         # Successor matrix [N, N]
         successor_matrix = np.zeros((max(n_lanes, 1), max(n_lanes, 1)), dtype=np.int8)
@@ -1029,6 +1399,7 @@ class DirectionalPlannerServer(Node):
                     dir_x.astype(np.float32), dir_y.astype(np.float32),
                     global_lane_mask,
                     lane_masks_3d, lane_dir_x_3d, lane_dir_y_3d,
+                    edge_clearance_3d, curve_inner_3d,
                     successor_matrix,
                     start_lane_ids,
                     np.int32(sc), np.int32(sr), np.int32(gc), np.int32(gr),
@@ -1041,6 +1412,10 @@ class DirectionalPlannerServer(Node):
                     np.int32(self.forward_lock_cells ** 2),
                     self.enforce_lane_mask,
                     self.enforce_lane_successors,
+                    use_ec,
+                    np.float64(ec_weight),
+                    self.use_curve_clearance_cost and n_lanes > 0,
+                    np.float64(self.curve_clearance_weight if self.use_curve_clearance_cost else 0.0),
                     np.int32(rows), np.int32(cols),
                 )
                 used_numba = True
@@ -1061,6 +1436,7 @@ class DirectionalPlannerServer(Node):
                     dir_x.astype(np.float32), dir_y.astype(np.float32),
                     global_lane_mask,
                     lane_masks_3d, lane_dir_x_3d, lane_dir_y_3d,
+                    edge_clearance_3d, curve_inner_3d,
                     successor_matrix,
                     start_lane_ids,
                     np.int32(sc), np.int32(sr), np.int32(gc), np.int32(gr),
@@ -1073,6 +1449,10 @@ class DirectionalPlannerServer(Node):
                     np.int32(self.forward_lock_cells ** 2),
                     self.enforce_lane_mask,
                     self.enforce_lane_successors,
+                    use_ec,
+                    np.float64(ec_weight),
+                    self.use_curve_clearance_cost and n_lanes > 0,
+                    np.float64(self.curve_clearance_weight if self.use_curve_clearance_cost else 0.0),
                     np.int32(rows), np.int32(cols),
                 )
                 if len(path_cols) > 0:
@@ -1330,37 +1710,440 @@ class DirectionalPlannerServer(Node):
         if self.pub_markers:
             self._publish_path_arrows(path_msg)
 
+        # ── Optional path postprocessing ─────────────────────────────────
+        path_msg_original = path_msg  # keep reference to raw A* path
+        if self.use_path_postprocessing:
+            path_msg = self._postprocess_path(path_msg)
+
+            # ── Fallback: if postprocessing left < 2 poses, revert ───────
+            if len(path_msg.poses) < 2:
+                self.get_logger().warn(
+                    '[PATH_POSTPROCESS] Postprocessed path has < 2 poses! '
+                    'Falling back to original A* path.'
+                )
+                path_msg = path_msg_original
+
+            # ── Resample path to ensure dense-enough points ──────────────
+            resample_spacing = min(self.semi_goal_spacing / 2.0, 0.10)
+            path_msg = self._resample_path_by_spacing(path_msg, resample_spacing)
+        else:
+            self.get_logger().info('[PATH_POSTPROCESS] Disabled — using raw A* path.')
+
         # Generate semi-goals (pass original goal msg for last waypoint)
         self.main_goal = (goal_x, goal_y)
-        self._generate_semi_goals(path_msg, msg)
+        self._generate_semi_goals(path_msg, msg, path_msg_original=path_msg_original)
 
     # =====================================================================
-    # Semi-goal generation from A* path
+    # Path postprocessing — clean up A* path before semi-goal generation
     # =====================================================================
-    def _generate_semi_goals(self, path_msg: Path, original_goal: PoseStamped = None):
-        """Split path into semi-goals every semi_goal_spacing_m meters.
+    def _postprocess_path(self, path_msg: Path):
+        """
+        Clean up the raw A* path to remove zigzags, near-duplicates, and
+        collinear noise.  Then apply moving-average smoothing clamped to
+        max_smoothing_shift_m.  Smoothed points that fall outside the lane
+        mask are reverted to original.
+
+        Returns a NEW Path message (does not mutate the input).
+        """
+        if len(path_msg.poses) < 3:
+            self.get_logger().info('[PATH_POSTPROCESS] Path too short to postprocess.')
+            return path_msg
+
+        # ── Extract world points ─────────────────────────────────────────
+        raw_pts = [
+            (p.pose.position.x, p.pose.position.y)
+            for p in path_msg.poses
+        ]
+        n_original = len(raw_pts)
+
+        # ── Step 1: Remove duplicate / near-duplicate points ─────────────
+        dedup_pts = [raw_pts[0]]
+        dedup_tol = 1e-4  # ~0.1mm — essentially exact duplicates
+        for i in range(1, len(raw_pts)):
+            dx = raw_pts[i][0] - dedup_pts[-1][0]
+            dy = raw_pts[i][1] - dedup_pts[-1][1]
+            if math.sqrt(dx*dx + dy*dy) > dedup_tol:
+                dedup_pts.append(raw_pts[i])
+        n_after_dedup = len(dedup_pts)
+
+        # ── Step 2: Remove micro-zigzags ─────────────────────────────────
+        # A zigzag is where the direction suddenly reverses (dot < 0)
+        if len(dedup_pts) >= 3:
+            clean_pts = [dedup_pts[0], dedup_pts[1]]
+            for i in range(2, len(dedup_pts)):
+                # Direction from prev-prev to prev
+                ax = clean_pts[-1][0] - clean_pts[-2][0]
+                ay = clean_pts[-1][1] - clean_pts[-2][1]
+                # Direction from prev to current
+                bx = dedup_pts[i][0] - clean_pts[-1][0]
+                by = dedup_pts[i][1] - clean_pts[-1][1]
+                a_norm = math.sqrt(ax*ax + ay*ay)
+                b_norm = math.sqrt(bx*bx + by*by)
+                if a_norm > 1e-6 and b_norm > 1e-6:
+                    dot = (ax*bx + ay*by) / (a_norm * b_norm)
+                    if dot < -0.5:
+                        # Severe reversal — skip the previous point (it's the zigzag tip)
+                        clean_pts[-1] = dedup_pts[i]
+                        continue
+                clean_pts.append(dedup_pts[i])
+        else:
+            clean_pts = list(dedup_pts)
+        n_after_zigzag = len(clean_pts)
+
+        # ── Step 3: Remove collinear points ──────────────────────────────
+        tol = self.path_prune_collinear_tolerance_m
+        if len(clean_pts) >= 3:
+            pruned = [clean_pts[0]]
+            for i in range(1, len(clean_pts) - 1):
+                # Perpendicular distance from point i to line (pruned[-1] → clean_pts[i+1])
+                ax = clean_pts[i+1][0] - pruned[-1][0]
+                ay = clean_pts[i+1][1] - pruned[-1][1]
+                bx = clean_pts[i][0] - pruned[-1][0]
+                by = clean_pts[i][1] - pruned[-1][1]
+                line_len = math.sqrt(ax*ax + ay*ay)
+                if line_len < 1e-6:
+                    continue
+                # Cross product magnitude / line length = perpendicular distance
+                perp_dist = abs(ax*by - ay*bx) / line_len
+                if perp_dist > tol:
+                    pruned.append(clean_pts[i])
+            pruned.append(clean_pts[-1])  # always keep last
+        else:
+            pruned = list(clean_pts)
+        n_after_prune = len(pruned)
+
+        # ── Step 4: Moving-average smoothing ─────────────────────────────
+        window = self.path_smoothing_window
+        max_shift = self.max_smoothing_shift_m
+        half_w = window // 2
+        smoothed = list(pruned)  # copy
+        max_actual_shift = 0.0
+        n_reverted_shift = 0
+
+        if len(pruned) > window and window >= 3:
+            for i in range(1, len(pruned) - 1):  # never move first/last
+                lo = max(0, i - half_w)
+                hi = min(len(pruned), i + half_w + 1)
+                avg_x = sum(p[0] for p in pruned[lo:hi]) / (hi - lo)
+                avg_y = sum(p[1] for p in pruned[lo:hi]) / (hi - lo)
+
+                shift = math.sqrt(
+                    (avg_x - pruned[i][0])**2 +
+                    (avg_y - pruned[i][1])**2
+                )
+
+                if shift > max_shift:
+                    # Clamp: move only max_shift in the direction of avg
+                    ratio = max_shift / shift
+                    avg_x = pruned[i][0] + (avg_x - pruned[i][0]) * ratio
+                    avg_y = pruned[i][1] + (avg_y - pruned[i][1]) * ratio
+                    shift = max_shift
+
+                max_actual_shift = max(max_actual_shift, shift)
+                smoothed[i] = (avg_x, avg_y)
+
+        # ── Step 5: Validate smoothed points against lane mask ───────────
+        n_rejected_lane = 0
+        if self.use_independent_lanes and self.lanes_loaded and self.lane_grids:
+            for i in range(1, len(smoothed) - 1):
+                sx, sy = smoothed[i]
+                col, row = self._world_to_grid(sx, sy)
+                if not self._in_bounds(col, row):
+                    # Out of map — revert
+                    smoothed[i] = pruned[i]
+                    n_rejected_lane += 1
+                    continue
+                # Check if it's inside any lane mask
+                in_lane = False
+                for lid, ldata in self.lane_grids.items():
+                    if ldata['mask'][row, col] > 0.5:
+                        in_lane = True
+                        break
+                if not in_lane:
+                    smoothed[i] = pruned[i]
+                    n_rejected_lane += 1
+        elif self.enforce_lane_mask and self.latest_layers is not None:
+            # Global lane mask fallback
+            global_mask = self.latest_layers.get('lane_mask', None)
+            if global_mask is not None:
+                for i in range(1, len(smoothed) - 1):
+                    sx, sy = smoothed[i]
+                    col, row = self._world_to_grid(sx, sy)
+                    if not self._in_bounds(col, row) or global_mask[row, col] < 0.5:
+                        smoothed[i] = pruned[i]
+                        n_rejected_lane += 1
+
+        # ── Build new Path message ───────────────────────────────────────
+        new_path = Path()
+        new_path.header = path_msg.header
+
+        for (wx, wy) in smoothed:
+            ps = PoseStamped()
+            ps.header = path_msg.header
+            ps.pose.position.x = float(wx)
+            ps.pose.position.y = float(wy)
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.w = 1.0
+            new_path.poses.append(ps)
+
+        # Recompute orientations
+        for i in range(len(new_path.poses) - 1):
+            p1 = new_path.poses[i].pose.position
+            p2 = new_path.poses[i + 1].pose.position
+            yaw = math.atan2(p2.y - p1.y, p2.x - p1.x)
+            new_path.poses[i].pose.orientation.z = math.sin(yaw / 2.0)
+            new_path.poses[i].pose.orientation.w = math.cos(yaw / 2.0)
+        if len(new_path.poses) >= 2:
+            new_path.poses[-1].pose.orientation = new_path.poses[-2].pose.orientation
+
+        # ── Log summary ──────────────────────────────────────────────────
+        self.get_logger().info(
+            f'[PATH_POSTPROCESS] '
+            f'original={n_original}, '
+            f'after_dedup={n_after_dedup}, '
+            f'after_zigzag_removal={n_after_zigzag}, '
+            f'after_collinear_prune={n_after_prune}, '
+            f'final_smoothed={len(smoothed)}, '
+            f'max_shift={max_actual_shift:.4f}m, '
+            f'rejected_out_of_lane={n_rejected_lane}'
+        )
+
+        return new_path
+
+    # =====================================================================
+    # Resample path — ensure points every spacing_m along the path
+    # =====================================================================
+    def _resample_path_by_spacing(self, path_msg: Path, spacing_m: float):
+        """
+        Take a path (possibly with few points after pruning) and return a
+        new path with points interpolated every spacing_m metres along the
+        original polyline.  First and last points are always preserved.
+        """
+        if len(path_msg.poses) < 2 or spacing_m <= 0.0:
+            return path_msg
+
+        # Extract (x, y) list
+        pts = [
+            (p.pose.position.x, p.pose.position.y)
+            for p in path_msg.poses
+        ]
+
+        resampled = [pts[0]]  # always keep first
+        residual = 0.0  # distance accumulated since last emitted point
+
+        for i in range(1, len(pts)):
+            seg_dx = pts[i][0] - pts[i - 1][0]
+            seg_dy = pts[i][1] - pts[i - 1][1]
+            seg_len = math.sqrt(seg_dx * seg_dx + seg_dy * seg_dy)
+            if seg_len < 1e-9:
+                continue
+
+            # Unit direction along this segment
+            ux = seg_dx / seg_len
+            uy = seg_dy / seg_len
+
+            consumed = 0.0  # distance consumed along this segment
+
+            # First potential point: fill the residual from previous segment
+            first_gap = spacing_m - residual
+            if first_gap <= seg_len:
+                consumed = first_gap
+                resampled.append((
+                    pts[i - 1][0] + ux * consumed,
+                    pts[i - 1][1] + uy * consumed,
+                ))
+                # Continue placing points at full spacing intervals
+                while consumed + spacing_m <= seg_len:
+                    consumed += spacing_m
+                    resampled.append((
+                        pts[i - 1][0] + ux * consumed,
+                        pts[i - 1][1] + uy * consumed,
+                    ))
+                residual = seg_len - consumed
+            else:
+                # Entire segment fits inside the residual gap
+                residual += seg_len
+
+        # Always keep last point (exact goal position)
+        last = pts[-1]
+        if resampled:
+            dx = last[0] - resampled[-1][0]
+            dy = last[1] - resampled[-1][1]
+            if math.sqrt(dx * dx + dy * dy) > 1e-6:
+                resampled.append(last)
+            else:
+                resampled[-1] = last  # snap to exact
+        else:
+            resampled.append(last)
+
+        # Build new Path message
+        new_path = Path()
+        new_path.header = path_msg.header
+
+        for (wx, wy) in resampled:
+            ps = PoseStamped()
+            ps.header = path_msg.header
+            ps.pose.position.x = float(wx)
+            ps.pose.position.y = float(wy)
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.w = 1.0
+            new_path.poses.append(ps)
+
+        # Recompute orientations
+        for i in range(len(new_path.poses) - 1):
+            p1 = new_path.poses[i].pose.position
+            p2 = new_path.poses[i + 1].pose.position
+            yaw = math.atan2(p2.y - p1.y, p2.x - p1.x)
+            new_path.poses[i].pose.orientation.z = math.sin(yaw / 2.0)
+            new_path.poses[i].pose.orientation.w = math.cos(yaw / 2.0)
+        if len(new_path.poses) >= 2:
+            new_path.poses[-1].pose.orientation = new_path.poses[-2].pose.orientation
+
+        self.get_logger().info(
+            f'[RESAMPLE] input_poses={len(path_msg.poses)}, '
+            f'output_poses={len(new_path.poses)}, '
+            f'spacing={spacing_m:.4f}m'
+        )
+
+        return new_path
+
+    # =====================================================================
+    # Semi-goal generation from A* path — segment interpolation
+    # =====================================================================
+    def _generate_semi_goals(self, path_msg: Path,
+                             original_goal: PoseStamped = None,
+                             path_msg_original: Path = None):
+        """Generate semi-goals every semi_goal_spacing_m metres by
+        interpolating along each segment of the path polyline.
+
+        This is robust to sparse / postprocessed paths because it does NOT
+        depend on existing path points — it walks along the polyline and
+        places semi-goals at exact spacing intervals.
+
         Orientations point toward the NEXT semi-goal.
         Last semi-goal is a copy of the original /bt/goal."""
-        if not path_msg.poses:
+
+        # ── Logging: path stats received ─────────────────────────────────
+        n_poses = len(path_msg.poses)
+        self.get_logger().info(
+            f'[SEMI_GOALS] Received path with {n_poses} poses, '
+            f'semi_goal_spacing_m={self.semi_goal_spacing:.3f}m'
+        )
+
+        # ── Guard: need at least 2 poses ─────────────────────────────────
+        if n_poses < 2:
+            if path_msg_original is not None and len(path_msg_original.poses) >= 2:
+                self.get_logger().warn(
+                    f'[SEMI_GOALS] Path has {n_poses} poses (< 2). '
+                    'Falling back to original A* path '
+                    f'({len(path_msg_original.poses)} poses).'
+                )
+                path_msg = path_msg_original
+                n_poses = len(path_msg.poses)
+            else:
+                self.get_logger().warn(
+                    f'[SEMI_GOALS] Path has {n_poses} poses (< 2) '
+                    'and no original fallback available — cannot generate semi-goals.'
+                )
+                return
+
+        if n_poses < 2:
             return
 
+        # ── Compute total path length ────────────────────────────────────
+        total_length = 0.0
+        for i in range(1, n_poses):
+            dx = path_msg.poses[i].pose.position.x - path_msg.poses[i - 1].pose.position.x
+            dy = path_msg.poses[i].pose.position.y - path_msg.poses[i - 1].pose.position.y
+            total_length += math.sqrt(dx * dx + dy * dy)
+
+        self.get_logger().info(
+            f'[SEMI_GOALS] Total path length={total_length:.3f}m'
+        )
+
+        # ── Precompute Adaptive Spacing per segment ──────────────────────
+        segment_spacings = [self.semi_goal_spacing] * (n_poses - 1)
+        if self.use_adaptive_semigoal_spacing:
+            is_curve = [False] * (n_poses - 1)
+            angle_thresh = math.radians(self.curve_spacing_angle_threshold_deg)
+            for i in range(1, n_poses - 1):
+                p1 = path_msg.poses[i - 1].pose.position
+                p2 = path_msg.poses[i].pose.position
+                p3 = path_msg.poses[i + 1].pose.position
+
+                v1x, v1y = p2.x - p1.x, p2.y - p1.y
+                v2x, v2y = p3.x - p2.x, p3.y - p2.y
+
+                mag1 = math.sqrt(v1x * v1x + v1y * v1y)
+                mag2 = math.sqrt(v2x * v2x + v2y * v2y)
+
+                if mag1 > 1e-6 and mag2 > 1e-6:
+                    dot = (v1x * v2x + v1y * v2y) / (mag1 * mag2)
+                    dot = max(-1.0, min(1.0, dot))
+                    angle = math.acos(dot)
+                    if angle > angle_thresh:
+                        is_curve[i - 1] = True
+                        is_curve[i] = True
+                        if i > 1: is_curve[i - 2] = True # buffer before
+                        if i < n_poses - 2: is_curve[i + 1] = True # buffer after
+
+            straight_sp = self.straight_semigoal_spacing_m
+            curve_sp = self.curve_semigoal_spacing_m
+            segment_spacings = [curve_sp if c else straight_sp for c in is_curve]
+            
+            curves_count = sum(is_curve)
+            self.get_logger().info(
+                f'[SEMI_GOALS] Adaptive spacing: {curves_count} curve segments '
+                f'(spacing={curve_sp}m), {len(is_curve) - curves_count} straight '
+                f'(spacing={straight_sp}m)'
+            )
+
+        # ── Walk along the polyline, interpolating semi-goals ────────────
         semi_goals = []
-        accumulated_dist = 0.0
+        accumulated_dist = 0.0  # distance since last emitted semi-goal
+        used_interpolation = False
 
-        # Start from index 1 to skip the robot's current location
-        last_x = path_msg.poses[0].pose.position.x
-        last_y = path_msg.poses[0].pose.position.y
+        for i in range(1, n_poses):
+            ax = path_msg.poses[i - 1].pose.position.x
+            ay = path_msg.poses[i - 1].pose.position.y
+            bx = path_msg.poses[i].pose.position.x
+            by = path_msg.poses[i].pose.position.y
 
-        for i in range(1, len(path_msg.poses)):
-            px = path_msg.poses[i].pose.position.x
-            py = path_msg.poses[i].pose.position.y
-            seg_dist = math.sqrt((px - last_x)**2 + (py - last_y)**2)
-            accumulated_dist += seg_dist
-            last_x, last_y = px, py
+            seg_dx = bx - ax
+            seg_dy = by - ay
+            seg_len = math.sqrt(seg_dx * seg_dx + seg_dy * seg_dy)
+            if seg_len < 1e-9:
+                continue
+                
+            spacing = segment_spacings[i - 1] if self.use_adaptive_semigoal_spacing else self.semi_goal_spacing
 
-            if accumulated_dist >= self.semi_goal_spacing:
-                semi_goals.append((px, py, 0.0))  # yaw will be recalculated
+            ux = seg_dx / seg_len
+            uy = seg_dy / seg_len
+
+            # Position along segment (offset from point A)
+            consumed = 0.0
+
+            # How far until next semi-goal?
+            remaining_to_next = spacing - accumulated_dist
+            if self.use_adaptive_semigoal_spacing and remaining_to_next <= 0:
+                remaining_to_next = 1e-3
+
+            while consumed + remaining_to_next <= seg_len:
+                consumed += remaining_to_next
+                px = ax + ux * consumed
+                py = ay + uy * consumed
+                semi_goals.append((px, py, 0.0))
                 accumulated_dist = 0.0
+                remaining_to_next = spacing
+                # If the interpolated point doesn't coincide with a path
+                # vertex, flag that interpolation was used
+                dx_to_b = bx - px
+                dy_to_b = by - py
+                if math.sqrt(dx_to_b * dx_to_b + dy_to_b * dy_to_b) > 1e-4:
+                    used_interpolation = True
+
+            # Leftover distance on this segment (not enough for a semi-goal)
+            accumulated_dist += (seg_len - consumed)
 
         # ── Last semi-goal = copy of /bt/goal ────────────────────────────
         if original_goal is not None:
@@ -1394,6 +2177,22 @@ class DirectionalPlannerServer(Node):
             ) > 0.1:
                 semi_goals.append((lx, ly, lyaw))
 
+        # ── Fallback: 0 semi-goals → use original path ──────────────────
+        if len(semi_goals) == 0:
+            self.get_logger().warn(
+                '[SEMI_GOALS] Generated 0 semi-goals! '
+                'Falling back to original A* path.'
+            )
+            if path_msg_original is not None and len(path_msg_original.poses) >= 2:
+                return self._generate_semi_goals(
+                    path_msg_original, original_goal, path_msg_original=None
+                )
+            else:
+                self.get_logger().error(
+                    '[SEMI_GOALS] No fallback path available — navigation aborted.'
+                )
+                return
+
         # ── Recalculate orientations: each points toward the NEXT ────────
         for i in range(len(semi_goals) - 1):
             sx, sy, _ = semi_goals[i]
@@ -1407,15 +2206,360 @@ class DirectionalPlannerServer(Node):
         self.navigating = True
 
         self.get_logger().info(
-            f'Generated {len(semi_goals)} semi-goals '
-            f'(spacing={self.semi_goal_spacing}m)'
+            f'[SEMI_GOALS] Generated {len(semi_goals)} semi-goals '
+            f'(spacing={self.semi_goal_spacing}m, '
+            f'path_poses={n_poses}, '
+            f'interpolation_used={used_interpolation})'
         )
+
+        # ── Optional zigzag cleanup ──────────────────────────────────────
+        if self.use_semigoal_zigzag_cleanup:
+            self._cleanup_semigoal_zigzags()
+
+        # ── Optional curve yaw opening ───────────────────────────────────
+        if self.use_curve_yaw_opening:
+            self._apply_curve_yaw_opening()
 
         # Publish debug markers for ALL semi-goals
         self._publish_sg_markers()
 
         # Publish the FIRST semi-goal immediately
         self._publish_current_semi_goal()
+
+    # =====================================================================
+    # Normalize Angle Utility
+    # =====================================================================
+    def _normalize_angle(self, angle):
+        """Normalize an angle to [-pi, pi]"""
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    # =====================================================================
+    # Curve Yaw Opening
+    # =====================================================================
+    def _apply_curve_yaw_opening(self):
+        """
+        Detects curves in the semi-goals path and modifies the yaw of the 
+        semi-goals to point slightly outwards, preventing the robot from 
+        cutting the inner corner.
+        """
+        N = len(self.semi_goals)
+        if N < 4:
+            return
+
+        # Precompute headings between consecutive semi-goals
+        headings = np.zeros(N - 1, dtype=np.float64)
+        for j in range(N - 1):
+            sx, sy, _ = self.semi_goals[j]
+            nx, ny, _ = self.semi_goals[j + 1]
+            headings[j] = math.atan2(ny - sy, nx - sx)
+
+        # Precompute angle changes (deltas) between consecutive segments
+        deltas = np.zeros(N - 2, dtype=np.float64)
+        for j in range(1, N - 1):
+            deltas[j - 1] = self._normalize_angle(headings[j] - headings[j - 1])
+
+        window_size = self.curve_yaw_window_size
+        min_consecutive = self.curve_min_consecutive_changes
+        delta_min_rad = math.radians(self.curve_delta_angle_min_deg)
+        std_max_rad = math.radians(self.curve_delta_angle_std_max_deg)
+        total_min_rad = math.radians(self.curve_total_angle_min_deg)
+        opening_yaw_rad = math.radians(self.curve_opening_yaw_deg)
+        opening_yaw_max_rad = math.radians(self.curve_opening_yaw_max_deg)
+
+        modified_count = 0
+        left_curves = 0
+        right_curves = 0
+
+        curve_offsets = np.zeros(N, dtype=np.float64)
+        curve_types = np.zeros(N, dtype=np.int8)  # 1 for left, -1 for right
+
+        # Pass 1: Detect curves and compute base offsets
+        for i in range(1, N - 1):
+            # Extract a local window centered around i. 
+            center_idx = i - 1
+            half_w = window_size // 2
+            start_idx = max(0, center_idx - half_w)
+            end_idx = min(len(deltas), center_idx + half_w + 1)
+            
+            window_deltas = deltas[start_idx:end_idx]
+            if len(window_deltas) == 0:
+                continue
+
+            longest_seq = []
+            current_seq = []
+            for d in window_deltas:
+                if abs(d) >= delta_min_rad:
+                    if not current_seq:
+                        current_seq.append(d)
+                    else:
+                        if np.sign(d) == np.sign(current_seq[0]):
+                            current_seq.append(d)
+                        else:
+                            if len(current_seq) > len(longest_seq):
+                                longest_seq = current_seq
+                            current_seq = [d]
+                else:
+                    if len(current_seq) > len(longest_seq):
+                        longest_seq = current_seq
+                    current_seq = []
+            if len(current_seq) > len(longest_seq):
+                longest_seq = current_seq
+
+            if len(longest_seq) >= min_consecutive:
+                std_dev = float(np.std(longest_seq))
+                abs_sum = float(np.sum(np.abs(longest_seq)))
+                if std_dev <= std_max_rad and abs_sum >= total_min_rad:
+                    avg_sign = np.sign(longest_seq[0])
+                    if avg_sign > 0:
+                        curve_offsets[i] = -opening_yaw_rad
+                        curve_types[i] = 1
+                    else:
+                        curve_offsets[i] = opening_yaw_rad
+                        curve_types[i] = -1
+
+        # Pass 2: Anticipate (Propagate backwards)
+        anticipation = self.curve_anticipation_points
+        if anticipation > 0:
+            anticipated_offsets = curve_offsets.copy()
+            anticipated_types = curve_types.copy()
+            for i in range(1, N - 1):
+                if curve_offsets[i] == 0.0:
+                    for lookahead in range(1, anticipation + 1):
+                        idx = i + lookahead
+                        if idx < N - 1 and curve_offsets[idx] != 0.0:
+                            anticipated_offsets[i] = curve_offsets[idx]
+                            anticipated_types[i] = curve_types[idx]
+                            break
+            curve_offsets = anticipated_offsets
+            curve_types = anticipated_types
+
+        # Pass 3: Apply offsets
+        for i in range(1, N - 1):
+            if curve_offsets[i] != 0.0:
+                x, y, yaw_base = self.semi_goals[i]
+                yaw_open = yaw_base + curve_offsets[i]
+                
+                # Clamp offset
+                if abs(self._normalize_angle(yaw_open - yaw_base)) > opening_yaw_max_rad:
+                    yaw_open = yaw_base + np.sign(curve_offsets[i]) * opening_yaw_max_rad
+                
+                self.semi_goals[i] = (x, y, self._normalize_angle(yaw_open))
+                modified_count += 1
+                if curve_types[i] == 1:
+                    left_curves += 1
+                elif curve_types[i] == -1:
+                    right_curves += 1
+
+        self.get_logger().info(
+            f'[CURVE_YAW_OPENING] Analyzed {N} semi-goals. Modified {modified_count} '
+            f'(Left curves: {left_curves}, Right curves: {right_curves})'
+        )
+
+    # =====================================================================
+    # Lane-safety check for a straight segment
+    # =====================================================================
+    def _is_segment_lane_safe(self, x1, y1, x2, y2):
+        """Return True if all sampled points along (x1,y1)→(x2,y2) lie
+        inside a valid lane mask (or inside the map if no lanes loaded).
+        Sampling step is semigoal_segment_check_step_m."""
+        step = self.semigoal_segment_check_step_m
+        dx = x2 - x1
+        dy = y2 - y1
+        seg_len = math.sqrt(dx * dx + dy * dy)
+        if seg_len < 1e-9:
+            return True
+
+        n_samples = max(2, int(math.ceil(seg_len / step)) + 1)
+
+        for s in range(n_samples):
+            t = s / max(n_samples - 1, 1)
+            px = x1 + dx * t
+            py = y1 + dy * t
+            col, row = self._world_to_grid(px, py)
+
+            if not self._in_bounds(col, row):
+                return False
+
+            # Check lane masks
+            if self.use_independent_lanes and self.lanes_loaded and self.lane_grids:
+                in_lane = False
+                for ldata in self.lane_grids.values():
+                    if ldata['mask'][row, col] > 0.5:
+                        in_lane = True
+                        break
+                if not in_lane:
+                    return False
+            elif self.enforce_lane_mask and self.latest_layers is not None:
+                global_mask = self.latest_layers.get('lane_mask', None)
+                if global_mask is not None and global_mask[row, col] < 0.5:
+                    return False
+
+        return True
+
+    # =====================================================================
+    # Semi-goal zigzag cleanup — local correction without global smoothing
+    # =====================================================================
+    def _cleanup_semigoal_zigzags(self):
+        """Analyze consecutive triples of semi-goals and remove or project
+        middle points that form zigzags, but ONLY if the resulting segments
+        are lane-safe.  First and last semi-goals are never modified."""
+        sg = self.semi_goals
+        if len(sg) < 3:
+            self.get_logger().info('[ZIGZAG_CLEANUP] < 3 semi-goals — nothing to clean.')
+            return
+
+        angle_thresh_rad = math.radians(self.zigzag_angle_threshold_deg)
+        lateral_thresh = self.zigzag_lateral_threshold_m
+        max_shift = self.max_zigzag_fix_shift_m
+
+        n_before = len(sg)
+        n_zigzags_detected = 0
+        n_removed = 0
+        n_corrected = 0
+        n_rejected = 0
+        n_blocked_by_limit = 0
+        n_blocked_by_length = 0
+        n_blocked_by_min_keep = 0
+
+        # Save last semi-goal orientation (must be preserved)
+        last_yaw = sg[-1][2]
+
+        # We iterate backwards so index removals don't shift remaining items
+        i = len(sg) - 2  # start at second-to-last (skip last)
+        while i >= 1:     # skip first (index 0)
+            px, py, _ = sg[i - 1]
+            cx, cy, _ = sg[i]
+            nx, ny, _ = sg[i + 1]
+
+            # ── Direction vectors ────────────────────────────────────────
+            v1x = cx - px
+            v1y = cy - py
+            v2x = nx - cx
+            v2y = ny - cy
+            mag1 = math.sqrt(v1x * v1x + v1y * v1y)
+            mag2 = math.sqrt(v2x * v2x + v2y * v2y)
+
+            if mag1 < 1e-9 or mag2 < 1e-9:
+                i -= 1
+                continue
+
+            # Angle between consecutive direction vectors
+            dot = (v1x * v2x + v1y * v2y) / (mag1 * mag2)
+            dot = max(-1.0, min(1.0, dot))  # clamp for acos safety
+            angle = math.acos(dot)
+
+            # ── Lateral distance of P_curr from segment P_prev→P_next ───
+            seg_dx = nx - px
+            seg_dy = ny - py
+            seg_len = math.sqrt(seg_dx * seg_dx + seg_dy * seg_dy)
+            if seg_len < 1e-9:
+                i -= 1
+                continue
+            # Signed perpendicular distance (cross product / length)
+            lateral_dist = abs((seg_dx * (cy - py) - seg_dy * (cx - px)) / seg_len)
+
+            # ── Is this a zigzag? ────────────────────────────────────────
+            if angle < angle_thresh_rad or lateral_dist < lateral_thresh:
+                i -= 1
+                continue
+
+            n_zigzags_detected += 1
+
+            def attempt_correction():
+                # Parametric projection of (cx,cy) onto line (px,py)→(nx,ny)
+                t_proj = ((cx - px) * seg_dx + (cy - py) * seg_dy) / (seg_len * seg_len)
+                t_proj = max(0.0, min(1.0, t_proj))
+                proj_x = px + seg_dx * t_proj
+                proj_y = py + seg_dy * t_proj
+
+                # Limit displacement
+                shift_dx = proj_x - cx
+                shift_dy = proj_y - cy
+                shift_dist = math.sqrt(shift_dx * shift_dx + shift_dy * shift_dy)
+                if shift_dist > max_shift:
+                    ratio = max_shift / shift_dist
+                    proj_x = cx + shift_dx * ratio
+                    proj_y = cy + shift_dy * ratio
+
+                # Validate both sub-segments
+                if (self._is_segment_lane_safe(px, py, proj_x, proj_y) and
+                        self._is_segment_lane_safe(proj_x, proj_y, nx, ny)):
+                    return (proj_x, proj_y, 0.0)
+                return None
+
+            def attempt_deletion():
+                nonlocal n_blocked_by_limit, n_blocked_by_min_keep, n_blocked_by_length
+                if n_removed >= self.max_semigoal_deletions_per_path:
+                    n_blocked_by_limit += 1
+                    return False
+                if len(sg) <= self.min_semigoals_to_keep:
+                    n_blocked_by_min_keep += 1
+                    return False
+                if seg_len > self.max_direct_segment_after_deletion_m:
+                    n_blocked_by_length += 1
+                    return False
+                if self._is_segment_lane_safe(px, py, nx, ny):
+                    return True
+                return False
+
+            action_taken = False
+            if self.prefer_zigzag_correction_over_deletion:
+                corr = attempt_correction()
+                if corr:
+                    sg[i] = corr
+                    n_corrected += 1
+                    action_taken = True
+                else:
+                    if attempt_deletion():
+                        sg.pop(i)
+                        n_removed += 1
+                        action_taken = True
+            else:
+                if attempt_deletion():
+                    sg.pop(i)
+                    n_removed += 1
+                    action_taken = True
+                else:
+                    corr = attempt_correction()
+                    if corr:
+                        sg[i] = corr
+                        n_corrected += 1
+                        action_taken = True
+
+            if not action_taken:
+                n_rejected += 1
+
+            i -= 1
+
+        # ── Recalculate orientations ─────────────────────────────────────
+        for i in range(len(sg) - 1):
+            sx, sy, _ = sg[i]
+            nx2, ny2, _ = sg[i + 1]
+            yaw = math.atan2(ny2 - sy, nx2 - sx)
+            sg[i] = (sx, sy, yaw)
+        # Restore last semi-goal orientation (from /bt/goal)
+        if sg:
+            lx, ly, _ = sg[-1]
+            sg[-1] = (lx, ly, last_yaw)
+
+        self.semi_goals = sg
+
+        self.get_logger().info(
+            f'[ZIGZAG_CLEANUP] '
+            f'before={n_before}, '
+            f'zigzags_detected={n_zigzags_detected}, '
+            f'corrected={n_corrected}, '
+            f'removed={n_removed}, '
+            f'blocked_limit={n_blocked_by_limit}, '
+            f'blocked_length={n_blocked_by_length}, '
+            f'blocked_min_keep={n_blocked_by_min_keep}, '
+            f'rejected_unsafe={n_rejected}, '
+            f'after={len(sg)}'
+        )
 
     # =====================================================================
     # Semi-goal tick — monitor robot and advance

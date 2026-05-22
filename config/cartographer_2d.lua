@@ -21,7 +21,7 @@ options = {
   submap_publish_period_sec = 0.3,
   pose_publish_period_sec = 50e-3,
   trajectory_publish_period_sec = 30e-3,
-  rangefinder_sampling_ratio = 1.,
+  rangefinder_sampling_ratio = 0.7,
   odometry_sampling_ratio = 1.,
   fixed_frame_pose_sampling_ratio = 1.,
   imu_sampling_ratio = 1.,
@@ -58,7 +58,7 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.9
 TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(0.2)
 
 -- ── Pose graph (Loop Closure) ──────────────────────────────────
-POSE_GRAPH.optimize_every_n_nodes = 90
+POSE_GRAPH.optimize_every_n_nodes = 150
 POSE_GRAPH.constraint_builder.min_score = 0.65
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.70
 

@@ -70,10 +70,40 @@ directional_planner_server:
     # --- Semi-Goal Navigation ---
     mission_goals_topic: "/mission_goals"
     semi_goals_markers_topic: "/semi_goals_markers"
-    # semi_goal_spacing_m: Distancia entre puntos de la ruta que se envian a Nav2. Subir: Envias metas lejanas (movimiento mas rapido pero el coche traza sus propias curvas anchas). Bajar: Puntos muy juntos, el coche sigue la linea con exactitud quirurgica.
-    semi_goal_spacing_m: 0.43
+    # semi_goal_spacing_m: Distancia base/legacy entre puntos de la ruta que se envian a Nav2 (usado si use_adaptive_semigoal_spacing es false).
+    semi_goal_spacing_m: 0.38
     # semi_goal_tolerance: Precision con la que Nav2 debe atinar al punto antes de pasar al siguiente. Subir: Movimiento ininterrumpido (pasa "cerca" y avanza). Bajar: El coche se frena intentando cuadrarse exacto en cada punto.
     semi_goal_tolerance: 0.26
+    
+    # --- Adaptive Semi-Goal Spacing ---
+    # use_adaptive_semigoal_spacing: [true/false] Si es true, ajusta dinámicamente la distancia entre semi-goals dependiendo de si el tramo es recto o curvo.
+    use_adaptive_semigoal_spacing: false
+    # straight_semigoal_spacing_m: Espaciado usado en rectas (suele ser mayor para avance rápido).
+    straight_semigoal_spacing_m: 0.43
+    # curve_semigoal_spacing_m: Espaciado usado en curvas (más denso para evitar que el coche corte por dentro de la curva).
+    curve_semigoal_spacing_m: 0.43
+    # curve_spacing_angle_threshold_deg: Ángulo umbral para considerar que un tramo del path es una curva.
+    curve_spacing_angle_threshold_deg: 15.0
+
+    # --- Curve Yaw Opening (modifica orientación de semi-goals en curvas) ---
+    # use_curve_yaw_opening: [true/false] Si es true, abre la orientación (yaw) de los semi-goals en curvas opuesta al giro.
+    use_curve_yaw_opening: true
+    # curve_yaw_window_size: Tamaño de la ventana local para analizar cambios de ángulo (cantidad de puntos).
+    curve_yaw_window_size: 4
+    # curve_min_consecutive_changes: Mínimo de cambios consecutivos con el mismo signo para ser curva.
+    curve_min_consecutive_changes: 4
+    # curve_delta_angle_min_deg: Cambio mínimo (grados) entre segmentos para sumarlo a la detección de curva.
+    curve_delta_angle_min_deg: 4.0
+    # curve_delta_angle_std_max_deg: Desviación estándar máxima permitida en la ventana para considerar curva suave.
+    curve_delta_angle_std_max_deg: 8.0
+    # curve_total_angle_min_deg: Suma absoluta mínima de ángulos en la ventana para ser curva.
+    curve_total_angle_min_deg: 15.0
+    # curve_opening_yaw_deg: Ángulo de apertura a aplicar al yaw base.
+    curve_opening_yaw_deg: 12.0
+    # curve_opening_yaw_max_deg: Tope máximo del offset de yaw.
+    curve_opening_yaw_max_deg: 12.0
+    # curve_anticipation_points: Puntos previos a la curva a los que se les propagará la apertura de yaw (anticipación).
+    curve_anticipation_points: 1
 
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
@@ -85,6 +115,54 @@ directional_planner_server:
     right_bias_penalty: 0.15 # gradient-based right wall attraction strength 0.9
     # forward_lock_cells: Bloqueo de inicio. Celdas obligatorias en linea recta al empezar. Subir: Arranca derecho mucho tramo antes de dar vuelta. Bajar: Volantea abruptamente desde la celda de inicio.
     forward_lock_cells: 45 # strict 90° forward within this radius (cells from start)
+
+    # --- Edge Clearance Cost (penalizacion suave por cercania al borde del lane) ---
+    # use_edge_clearance_cost: [true/false] Si es true, suma un costo extra a las celdas cercanas al borde del carril para empujar la ruta hacia el centro.
+    use_edge_clearance_cost: true
+    # edge_clearance_weight: Peso del costo de clearance. Subir: Empuja la ruta mas agresivamente al centro. Bajar: Efecto sutil, la ruta casi no se mueve.
+    edge_clearance_weight: 0.08
+    # min_clearance_to_lane_edge_m: Distancia (metros) desde el borde del carril donde se aplica penalizacion. Celdas mas lejos que esto no reciben ningun costo extra.
+    min_clearance_to_lane_edge_m: 0.16
+
+    # --- Curve Inner Clearance Cost (penalizacion solo en el borde interno de las curvas) ---
+    # use_curve_clearance_cost: [true/false] Si es true, añade un costo solo en el interior de las curvas para forzar a que el A* abra la curva y no muerda la acera.
+    use_curve_clearance_cost: true
+    # curve_clearance_weight: Peso del costo. Subir: Castiga fuertemente acercarse al borde interno.
+    curve_clearance_weight: 0.30
+    # curve_angle_threshold_deg: Angulo minimo (grados) entre segmentos para considerar que el carril está doblando.
+    curve_angle_threshold_deg: 15.0
+    # curve_inner_clearance_m: Distancia (metros) desde el borde interno hacia el centro del carril que recibirá penalización de curva.
+    curve_inner_clearance_m: 0.25
+
+    # --- Path Postprocessing (limpieza del path antes de generar semi-goals) ---
+    # use_path_postprocessing: [true/false] Si es true, aplica limpieza y suavizado al path de A* antes de generar semi-goals. Si es false, el path se usa tal cual.
+    use_path_postprocessing: false
+    # path_smoothing_window: Ventana del moving average. Subir: Suaviza mas agresivamente (puede cortar curvas). Bajar: Mantiene la forma original con mínimo suavizado.
+    path_smoothing_window: 3
+    # path_prune_collinear_tolerance_m: Tolerancia (metros) para eliminar puntos casi alineados. Subir: Elimina mas puntos intermedios. Bajar: Conserva mas detalle.
+    path_prune_collinear_tolerance_m: 0.01
+    # max_smoothing_shift_m: Maximo desplazamiento (metros) que el suavizado puede mover un punto. Subir: Permite curvas mas suaves pero puede sacar del carril. Bajar: Limita el suavizado para no alejarse del path original.
+    max_smoothing_shift_m: 0.40
+
+    # --- Semi-Goal Zigzag Cleanup (correccion local de zigzags en semi-goals) ---
+    # use_semigoal_zigzag_cleanup: [true/false] Si es true, analiza tripletas de semi-goals y corrige zigzags locales sin modificar todo el path. Funciona independientemente de use_path_postprocessing.
+    use_semigoal_zigzag_cleanup: true
+    # prefer_zigzag_correction_over_deletion: [true/false] Si es true, prioriza proyectar el punto para corregirlo en lugar de eliminarlo (preserva mejor la cantidad de puntos).
+    prefer_zigzag_correction_over_deletion: true
+    # max_semigoal_deletions_per_path: Limite maximo de puntos que se pueden eliminar por cada ruta generada para no despoblar el path.
+    max_semigoal_deletions_per_path: 2
+    # min_semigoals_to_keep: Cantidad minima de semi-goals que debe tener el path para permitir una eliminacion.
+    min_semigoals_to_keep: 5
+    # max_direct_segment_after_deletion_m: Distancia maxima (metros) que puede tener el segmento resultante si se elimina el punto central. Si es mayor, no se elimina.
+    max_direct_segment_after_deletion_m: 0.35
+    # zigzag_angle_threshold_deg: Angulo minimo (grados) entre segmentos consecutivos para considerar zigzag. Subir: Solo corrige quiebres muy pronunciados. Bajar: Detecta desviaciones mas sutiles.
+    zigzag_angle_threshold_deg: 25.0
+    # zigzag_lateral_threshold_m: Distancia lateral minima (metros) del punto medio al segmento directo para considerar zigzag. Subir: Ignora desviaciones pequenas. Bajar: Detecta hasta micro-desviaciones.
+    zigzag_lateral_threshold_m: 0.03
+    # max_zigzag_fix_shift_m: Maximo desplazamiento (metros) al proyectar un punto zigzag sobre el segmento directo. Subir: Permite correcciones mas agresivas. Bajar: Limita el movimiento del punto.
+    max_zigzag_fix_shift_m: 0.08
+    # semigoal_segment_check_step_m: Paso (metros) para muestrear puntos al validar que un segmento es lane-safe. Subir: Validacion mas rapida pero menos precisa. Bajar: Validacion exhaustiva celda por celda.
+    semigoal_segment_check_step_m: 0.02
 
 map_loader_node:
   ros__parameters:
