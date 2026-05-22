@@ -91,11 +91,11 @@ directional_planner_server:
     curve_delta_angle_std_max_deg: 8.0
     curve_total_angle_min_deg: 12.0
     
-    curve_yaw_offset_max_deg: 7.0
-    curve_yaw_offset_min_deg: 1.0
-    curve_yaw_ramp_in_ratio: 0.45
-    curve_yaw_ramp_out_ratio: 0.45
-    curve_yaw_rate_limit_deg: 2.5
+    curve_yaw_offset_max_deg: 5.0
+    curve_yaw_offset_min_deg: 0.5
+    curve_yaw_ramp_in_ratio: 0.50
+    curve_yaw_ramp_out_ratio: 0.50
+    curve_yaw_rate_limit_deg: 2.0
     
     use_right_boundary_adaptive_opening: true
     right_boundary_check_distance_m: 0.35
@@ -103,6 +103,14 @@ directional_planner_server:
     right_boundary_far_m: 0.35
     right_boundary_check_step_m: 0.02
     minimum_opening_if_no_right_boundary_deg: 0.0
+
+    use_no_right_boundary_curve_tightening: true
+    no_right_boundary_tightening_gain: 0.55
+    no_right_boundary_near_m: 0.12
+    no_right_boundary_far_m: 0.30
+    no_right_boundary_check_distance_m: 0.45
+    no_right_boundary_check_step_m: 0.02
+    max_no_boundary_opening_reduction_ratio: 0.65
 
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
@@ -195,7 +203,7 @@ directional_planner_server:
     # preserve_final_goal: [true/false] Siempre conservar el ultimo semi-goal (goal final).
     preserve_final_goal: true
     # semigoal_marker_scale: Escala visual (metros) de los markers de semi-goals en RViz.
-    semigoal_marker_scale: 0.12
+    semigoal_marker_scale: 0.25
 
 map_loader_node:
   ros__parameters:

@@ -499,11 +499,11 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('curve_delta_angle_min_deg', 3.0)
         self.declare_parameter('curve_delta_angle_std_max_deg', 8.0)
         self.declare_parameter('curve_total_angle_min_deg', 12.0)
-        self.declare_parameter('curve_yaw_offset_max_deg', 7.0)
-        self.declare_parameter('curve_yaw_offset_min_deg', 1.0)
-        self.declare_parameter('curve_yaw_ramp_in_ratio', 0.45)
-        self.declare_parameter('curve_yaw_ramp_out_ratio', 0.45)
-        self.declare_parameter('curve_yaw_rate_limit_deg', 2.5)
+        self.declare_parameter('curve_yaw_offset_max_deg', 5.0)
+        self.declare_parameter('curve_yaw_offset_min_deg', 0.5)
+        self.declare_parameter('curve_yaw_ramp_in_ratio', 0.50)
+        self.declare_parameter('curve_yaw_ramp_out_ratio', 0.50)
+        self.declare_parameter('curve_yaw_rate_limit_deg', 2.0)
 
         self.declare_parameter('use_right_boundary_adaptive_opening', True)
         self.declare_parameter('right_boundary_check_distance_m', 0.35)
@@ -511,6 +511,14 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('right_boundary_far_m', 0.35)
         self.declare_parameter('right_boundary_check_step_m', 0.02)
         self.declare_parameter('minimum_opening_if_no_right_boundary_deg', 0.0)
+
+        self.declare_parameter('use_no_right_boundary_curve_tightening', False)
+        self.declare_parameter('no_right_boundary_tightening_gain', 0.35)
+        self.declare_parameter('no_right_boundary_near_m', 0.12)
+        self.declare_parameter('no_right_boundary_far_m', 0.35)
+        self.declare_parameter('no_right_boundary_check_distance_m', 0.45)
+        self.declare_parameter('no_right_boundary_check_step_m', 0.02)
+        self.declare_parameter('max_no_boundary_opening_reduction_ratio', 0.50)
 
         # Edge Clearance Cost (optional soft penalty near lane edges)
         self.declare_parameter('use_edge_clearance_cost', False)
@@ -610,6 +618,14 @@ class DirectionalPlannerServer(Node):
         self.right_boundary_far_m = float(self.get_parameter('right_boundary_far_m').value)
         self.right_boundary_check_step_m = float(self.get_parameter('right_boundary_check_step_m').value)
         self.minimum_opening_if_no_right_boundary_deg = float(self.get_parameter('minimum_opening_if_no_right_boundary_deg').value)
+
+        self.use_no_right_boundary_curve_tightening = bool(self.get_parameter('use_no_right_boundary_curve_tightening').value)
+        self.no_right_boundary_tightening_gain = float(self.get_parameter('no_right_boundary_tightening_gain').value)
+        self.no_right_boundary_near_m = float(self.get_parameter('no_right_boundary_near_m').value)
+        self.no_right_boundary_far_m = float(self.get_parameter('no_right_boundary_far_m').value)
+        self.no_right_boundary_check_distance_m = float(self.get_parameter('no_right_boundary_check_distance_m').value)
+        self.no_right_boundary_check_step_m = float(self.get_parameter('no_right_boundary_check_step_m').value)
+        self.max_no_boundary_opening_reduction_ratio = float(self.get_parameter('max_no_boundary_opening_reduction_ratio').value)
 
         # Edge Clearance Cost
         self.use_edge_clearance_cost = bool(self.get_parameter('use_edge_clearance_cost').value)
@@ -2456,12 +2472,14 @@ class DirectionalPlannerServer(Node):
         if inserted_points > 0:
             self.get_logger().info(f'[CURVE_SAFE_SPACING] Inserted {inserted_points} points. Repaired {unsafe_segments} unsafe segments.')
 
-    def _get_right_clearance(self, x, y, yaw):
+    def _get_right_clearance(self, x, y, yaw, max_dist=None, step=None):
         dx = math.sin(yaw)
         dy = -math.cos(yaw)
         dist = 0.0
-        max_dist = self.right_boundary_check_distance_m
-        step = self.right_boundary_check_step_m
+        if max_dist is None:
+            max_dist = self.right_boundary_check_distance_m
+        if step is None:
+            step = self.right_boundary_check_step_m
         while dist <= max_dist:
             px = x + dx * dist
             py = y + dy * dist
@@ -2601,6 +2619,39 @@ class DirectionalPlannerServer(Node):
                         offset_mag = self.minimum_opening_if_no_right_boundary_deg
                     else:
                         offset_mag = offset_mag * b_gain
+                        
+                if getattr(self, 'use_no_right_boundary_curve_tightening', False) and offset_mag > 1e-3:
+                    x, y, yaw_base = self.semi_goals[k]
+                    clearance2 = self._get_right_clearance(
+                        x, y, yaw_base,
+                        max_dist=self.no_right_boundary_check_distance_m,
+                        step=self.no_right_boundary_check_step_m
+                    )
+                    n_near = self.no_right_boundary_near_m
+                    n_far = self.no_right_boundary_far_m
+                    
+                    if clearance2 <= n_near:
+                        tightening_gain = 0.0
+                    elif clearance2 >= n_far:
+                        tightening_gain = 1.0
+                    else:
+                        tightening_gain = (clearance2 - n_near) / max(1e-6, n_far - n_near)
+                        
+                    reduction = self.no_right_boundary_tightening_gain * tightening_gain
+                    reduction = min(reduction, self.max_no_boundary_opening_reduction_ratio)
+                    
+                    orig_mag = offset_mag
+                    offset_mag = offset_mag * (1.0 - reduction)
+                    
+                    border_found = (clearance2 < self.no_right_boundary_check_distance_m)
+                    self.get_logger().debug(
+                        f'[CURVE_TIGHTENING] right_boundary_distance={clearance2:.3f}, '
+                        f'border_found={border_found}, '
+                        f'tightening_gain={tightening_gain:.2f}, '
+                        f'yaw_offset_original={orig_mag:.2f}, '
+                        f'yaw_offset_final={offset_mag:.2f}, '
+                        f'reduction={reduction:.2f}'
+                    )
                 
                 yaw_offsets[k] = -offset_mag if ctype == 1 else offset_mag
 
@@ -2617,7 +2668,11 @@ class DirectionalPlannerServer(Node):
                 self.semi_goals[i] = (x, y, yaw_open)
                 modified_count += 1
 
-        self.get_logger().info(f'[ACKERMANN_YAW] Analyzed {N} semi-goals. Modified {modified_count} across {len(blocks)} curves.')
+        self.get_logger().info(
+            f'[ACKERMANN_YAW] Analyzed {N} semi-goals. Modified {modified_count} across {len(blocks)} curves. '
+            f'Params -> max_deg={max_deg}, min_deg={min_deg}, rate_limit={rate_limit}. '
+            f'use_no_right_boundary_curve_tightening={getattr(self, "use_no_right_boundary_curve_tightening", False)}'
+        )
 
     # =====================================================================
     # Semi-Goal Yaw Validation & Repair
