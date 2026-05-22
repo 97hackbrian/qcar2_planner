@@ -485,22 +485,32 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('connection_threshold_m', 0.30)
         self.declare_parameter('lanes_yaml_path', '')
 
-        # Adaptive Semi-Goal Spacing
-        self.declare_parameter('use_adaptive_semigoal_spacing', False)
+        # Curve Safe Semigoal Spacing
+        self.declare_parameter('use_curve_safe_semigoal_spacing', True)
         self.declare_parameter('straight_semigoal_spacing_m', 0.30)
         self.declare_parameter('curve_semigoal_spacing_m', 0.18)
-        self.declare_parameter('curve_spacing_angle_threshold_deg', 15.0)
+        self.declare_parameter('max_curve_segment_length_m', 0.22)
+        self.declare_parameter('curve_segment_check_step_m', 0.02)
 
-        # Curve Yaw Opening
-        self.declare_parameter('use_curve_yaw_opening', False)
-        self.declare_parameter('curve_yaw_window_size', 5)
-        self.declare_parameter('curve_min_consecutive_changes', 3)
-        self.declare_parameter('curve_delta_angle_min_deg', 5.0)
+        # Ackermann Curve Yaw Offset
+        self.declare_parameter('use_ackermann_curve_yaw_offset', False)
+        self.declare_parameter('curve_detection_window', 5)
+        self.declare_parameter('curve_min_consecutive_angle_changes', 3)
+        self.declare_parameter('curve_delta_angle_min_deg', 3.0)
         self.declare_parameter('curve_delta_angle_std_max_deg', 8.0)
-        self.declare_parameter('curve_total_angle_min_deg', 15.0)
-        self.declare_parameter('curve_opening_yaw_deg', 12.0)
-        self.declare_parameter('curve_opening_yaw_max_deg', 20.0)
-        self.declare_parameter('curve_anticipation_points', 2)
+        self.declare_parameter('curve_total_angle_min_deg', 12.0)
+        self.declare_parameter('curve_yaw_offset_max_deg', 7.0)
+        self.declare_parameter('curve_yaw_offset_min_deg', 1.0)
+        self.declare_parameter('curve_yaw_ramp_in_ratio', 0.45)
+        self.declare_parameter('curve_yaw_ramp_out_ratio', 0.45)
+        self.declare_parameter('curve_yaw_rate_limit_deg', 2.5)
+
+        self.declare_parameter('use_right_boundary_adaptive_opening', True)
+        self.declare_parameter('right_boundary_check_distance_m', 0.35)
+        self.declare_parameter('right_boundary_near_m', 0.12)
+        self.declare_parameter('right_boundary_far_m', 0.35)
+        self.declare_parameter('right_boundary_check_step_m', 0.02)
+        self.declare_parameter('minimum_opening_if_no_right_boundary_deg', 0.0)
 
         # Edge Clearance Cost (optional soft penalty near lane edges)
         self.declare_parameter('use_edge_clearance_cost', False)
@@ -530,6 +540,25 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('max_zigzag_fix_shift_m', 0.12)
         self.declare_parameter('semigoal_segment_check_step_m', 0.02)
 
+        # Semi-Goal Yaw Validation
+        self.declare_parameter('use_semigoal_yaw_validation', True)
+        self.declare_parameter('min_yaw_segment_distance_m', 0.08)
+        self.declare_parameter('max_yaw_jump_deg', 45.0)
+        self.declare_parameter('yaw_smoothing_window', 3)
+        self.declare_parameter('preserve_final_goal_yaw', True)
+        self.declare_parameter('repair_bad_yaw_using_neighbors', True)
+
+        # Semi-Goal Sanitizer
+        self.declare_parameter('use_semigoal_sanitizer', True)
+        self.declare_parameter('min_semigoal_distance_m', 0.22)
+        self.declare_parameter('min_semigoal_distance_curve_m', 0.18)
+        self.declare_parameter('duplicate_semigoal_epsilon_m', 0.04)
+        self.declare_parameter('max_semigoal_filter_iterations', 3)
+        self.declare_parameter('max_semigoals_removed_per_path', 5)
+        self.declare_parameter('preserve_first_semigoal', True)
+        self.declare_parameter('preserve_final_goal', True)
+        self.declare_parameter('semigoal_marker_scale', 0.12)
+
         # ── Read parameters ─────────────────────────────────────────────────
         self.direction_penalty = self.get_parameter('direction_penalty').value
         self.occ_threshold = self.get_parameter('occupancy_threshold').value
@@ -554,22 +583,33 @@ class DirectionalPlannerServer(Node):
         self.enforce_lane_successors = bool(self.get_parameter('enforce_lane_successors').value)
         self.connection_threshold_m = float(self.get_parameter('connection_threshold_m').value)
 
-        # Adaptive Semi-Goal Spacing
-        self.use_adaptive_semigoal_spacing = bool(self.get_parameter('use_adaptive_semigoal_spacing').value)
+        # Curve Safe Semigoal Spacing
+        self.use_curve_safe_semigoal_spacing = bool(self.get_parameter('use_curve_safe_semigoal_spacing').value)
         self.straight_semigoal_spacing_m = float(self.get_parameter('straight_semigoal_spacing_m').value)
         self.curve_semigoal_spacing_m = float(self.get_parameter('curve_semigoal_spacing_m').value)
-        self.curve_spacing_angle_threshold_deg = float(self.get_parameter('curve_spacing_angle_threshold_deg').value)
+        self.max_curve_segment_length_m = float(self.get_parameter('max_curve_segment_length_m').value)
+        self.curve_segment_check_step_m = float(self.get_parameter('curve_segment_check_step_m').value)
 
-        # Curve Yaw Opening
-        self.use_curve_yaw_opening = bool(self.get_parameter('use_curve_yaw_opening').value)
-        self.curve_yaw_window_size = int(self.get_parameter('curve_yaw_window_size').value)
-        self.curve_min_consecutive_changes = int(self.get_parameter('curve_min_consecutive_changes').value)
+        # Ackermann Curve Yaw Offset
+        self.use_ackermann_curve_yaw_offset = bool(self.get_parameter('use_ackermann_curve_yaw_offset').value)
+        self.curve_detection_window = int(self.get_parameter('curve_detection_window').value)
+        self.curve_min_consecutive_angle_changes = int(self.get_parameter('curve_min_consecutive_angle_changes').value)
         self.curve_delta_angle_min_deg = float(self.get_parameter('curve_delta_angle_min_deg').value)
         self.curve_delta_angle_std_max_deg = float(self.get_parameter('curve_delta_angle_std_max_deg').value)
         self.curve_total_angle_min_deg = float(self.get_parameter('curve_total_angle_min_deg').value)
-        self.curve_opening_yaw_deg = float(self.get_parameter('curve_opening_yaw_deg').value)
-        self.curve_opening_yaw_max_deg = float(self.get_parameter('curve_opening_yaw_max_deg').value)
-        self.curve_anticipation_points = int(self.get_parameter('curve_anticipation_points').value)
+        
+        self.curve_yaw_offset_max_deg = float(self.get_parameter('curve_yaw_offset_max_deg').value)
+        self.curve_yaw_offset_min_deg = float(self.get_parameter('curve_yaw_offset_min_deg').value)
+        self.curve_yaw_ramp_in_ratio = float(self.get_parameter('curve_yaw_ramp_in_ratio').value)
+        self.curve_yaw_ramp_out_ratio = float(self.get_parameter('curve_yaw_ramp_out_ratio').value)
+        self.curve_yaw_rate_limit_deg = float(self.get_parameter('curve_yaw_rate_limit_deg').value)
+        
+        self.use_right_boundary_adaptive_opening = bool(self.get_parameter('use_right_boundary_adaptive_opening').value)
+        self.right_boundary_check_distance_m = float(self.get_parameter('right_boundary_check_distance_m').value)
+        self.right_boundary_near_m = float(self.get_parameter('right_boundary_near_m').value)
+        self.right_boundary_far_m = float(self.get_parameter('right_boundary_far_m').value)
+        self.right_boundary_check_step_m = float(self.get_parameter('right_boundary_check_step_m').value)
+        self.minimum_opening_if_no_right_boundary_deg = float(self.get_parameter('minimum_opening_if_no_right_boundary_deg').value)
 
         # Edge Clearance Cost
         self.use_edge_clearance_cost = bool(self.get_parameter('use_edge_clearance_cost').value)
@@ -649,6 +689,46 @@ class DirectionalPlannerServer(Node):
             f'lateral_thresh={self.zigzag_lateral_threshold_m}m, '
             f'max_shift={self.max_zigzag_fix_shift_m}m, '
             f'check_step={self.semigoal_segment_check_step_m}m'
+        )
+
+        # Semi-Goal Yaw Validation
+        self.use_semigoal_yaw_validation = bool(self.get_parameter('use_semigoal_yaw_validation').value)
+        self.min_yaw_segment_distance_m = float(self.get_parameter('min_yaw_segment_distance_m').value)
+        self.max_yaw_jump_deg = float(self.get_parameter('max_yaw_jump_deg').value)
+        self.yaw_smoothing_window = int(self.get_parameter('yaw_smoothing_window').value)
+        self.preserve_final_goal_yaw = bool(self.get_parameter('preserve_final_goal_yaw').value)
+        self.repair_bad_yaw_using_neighbors = bool(self.get_parameter('repair_bad_yaw_using_neighbors').value)
+
+        yv_state = 'ACTIVE' if self.use_semigoal_yaw_validation else 'INACTIVE'
+        self.get_logger().info(
+            f'[YAW_VALIDATION] {yv_state}: '
+            f'min_seg_dist={self.min_yaw_segment_distance_m}m, '
+            f'max_jump={self.max_yaw_jump_deg}°, '
+            f'smooth_win={self.yaw_smoothing_window}, '
+            f'preserve_final={self.preserve_final_goal_yaw}, '
+            f'repair={self.repair_bad_yaw_using_neighbors}'
+        )
+
+        # Semi-Goal Sanitizer
+        self.use_semigoal_sanitizer = bool(self.get_parameter('use_semigoal_sanitizer').value)
+        self.min_semigoal_distance_m = float(self.get_parameter('min_semigoal_distance_m').value)
+        self.min_semigoal_distance_curve_m = float(self.get_parameter('min_semigoal_distance_curve_m').value)
+        self.duplicate_semigoal_epsilon_m = float(self.get_parameter('duplicate_semigoal_epsilon_m').value)
+        self.max_semigoal_filter_iterations = int(self.get_parameter('max_semigoal_filter_iterations').value)
+        self.max_semigoals_removed_per_path = int(self.get_parameter('max_semigoals_removed_per_path').value)
+        self.preserve_first_semigoal = bool(self.get_parameter('preserve_first_semigoal').value)
+        self.preserve_final_goal = bool(self.get_parameter('preserve_final_goal').value)
+        self.semigoal_marker_scale = float(self.get_parameter('semigoal_marker_scale').value)
+
+        san_state = 'ACTIVE' if self.use_semigoal_sanitizer else 'INACTIVE'
+        self.get_logger().info(
+            f'[SANITIZER] {san_state}: '
+            f'min_dist={self.min_semigoal_distance_m}m, '
+            f'min_dist_curve={self.min_semigoal_distance_curve_m}m, '
+            f'dup_eps={self.duplicate_semigoal_epsilon_m}m, '
+            f'max_iter={self.max_semigoal_filter_iterations}, '
+            f'max_removed={self.max_semigoals_removed_per_path}, '
+            f'marker_scale={self.semigoal_marker_scale}m'
         )
 
         # ── State ───────────────────────────────────────────────────────────
@@ -2061,11 +2141,11 @@ class DirectionalPlannerServer(Node):
             f'[SEMI_GOALS] Total path length={total_length:.3f}m'
         )
 
-        # ── Precompute Adaptive Spacing per segment ──────────────────────
+        # ── Precompute Curve Safe Spacing per segment ──────────────────────
         segment_spacings = [self.semi_goal_spacing] * (n_poses - 1)
-        if self.use_adaptive_semigoal_spacing:
+        if self.use_curve_safe_semigoal_spacing:
             is_curve = [False] * (n_poses - 1)
-            angle_thresh = math.radians(self.curve_spacing_angle_threshold_deg)
+            angle_thresh = math.radians(15.0)
             for i in range(1, n_poses - 1):
                 p1 = path_msg.poses[i - 1].pose.position
                 p2 = path_msg.poses[i].pose.position
@@ -2093,7 +2173,7 @@ class DirectionalPlannerServer(Node):
             
             curves_count = sum(is_curve)
             self.get_logger().info(
-                f'[SEMI_GOALS] Adaptive spacing: {curves_count} curve segments '
+                f'[SEMI_GOALS] Curve Safe spacing: {curves_count} curve segments '
                 f'(spacing={curve_sp}m), {len(is_curve) - curves_count} straight '
                 f'(spacing={straight_sp}m)'
             )
@@ -2115,7 +2195,7 @@ class DirectionalPlannerServer(Node):
             if seg_len < 1e-9:
                 continue
                 
-            spacing = segment_spacings[i - 1] if self.use_adaptive_semigoal_spacing else self.semi_goal_spacing
+            spacing = segment_spacings[i - 1] if self.use_curve_safe_semigoal_spacing else self.semi_goal_spacing
 
             ux = seg_dx / seg_len
             uy = seg_dy / seg_len
@@ -2125,7 +2205,7 @@ class DirectionalPlannerServer(Node):
 
             # How far until next semi-goal?
             remaining_to_next = spacing - accumulated_dist
-            if self.use_adaptive_semigoal_spacing and remaining_to_next <= 0:
+            if self.use_curve_safe_semigoal_spacing and remaining_to_next <= 0:
                 remaining_to_next = 1e-3
 
             while consumed + remaining_to_next <= seg_len:
@@ -2216,9 +2296,20 @@ class DirectionalPlannerServer(Node):
         if self.use_semigoal_zigzag_cleanup:
             self._cleanup_semigoal_zigzags()
 
-        # ── Optional curve yaw opening ───────────────────────────────────
-        if self.use_curve_yaw_opening:
-            self._apply_curve_yaw_opening()
+        # ── Safe Curve Spacing ───────────────────────────────────────────
+        self._ensure_curve_safe_spacing(path_msg)
+
+        # ── Ackermann Curve Yaw Offset ───────────────────────────────────
+        if getattr(self, 'use_ackermann_curve_yaw_offset', False):
+            self._apply_ackermann_curve_yaw_offset()
+
+        # ── Yaw Validation & Repair (final stage) ───────────────────────
+        if getattr(self, 'use_semigoal_yaw_validation', False):
+            self._validate_and_repair_semigoal_yaws()
+
+        # ── Sanitizer (distance filter + robust yaw recalc) ─────────────
+        if getattr(self, 'use_semigoal_sanitizer', False):
+            self._sanitize_semigoals_before_publish()
 
         # Publish debug markers for ALL semi-goals
         self._publish_sg_markers()
@@ -2238,135 +2329,675 @@ class DirectionalPlannerServer(Node):
         return angle
 
     # =====================================================================
-    # Curve Yaw Opening
+    # Ackermann Curve Yaw Offset & Safe Spacing
     # =====================================================================
-    def _apply_curve_yaw_opening(self):
-        """
-        Detects curves in the semi-goals path and modifies the yaw of the 
-        semi-goals to point slightly outwards, preventing the robot from 
-        cutting the inner corner.
-        """
-        N = len(self.semi_goals)
-        if N < 4:
+    def _ensure_curve_safe_spacing(self, path_msg):
+        if not self.use_curve_safe_semigoal_spacing or len(self.semi_goals) < 3:
             return
 
-        # Precompute headings between consecutive semi-goals
+        N = len(self.semi_goals)
         headings = np.zeros(N - 1, dtype=np.float64)
         for j in range(N - 1):
             sx, sy, _ = self.semi_goals[j]
             nx, ny, _ = self.semi_goals[j + 1]
             headings[j] = math.atan2(ny - sy, nx - sx)
 
-        # Precompute angle changes (deltas) between consecutive segments
         deltas = np.zeros(N - 2, dtype=np.float64)
         for j in range(1, N - 1):
             deltas[j - 1] = self._normalize_angle(headings[j] - headings[j - 1])
 
-        window_size = self.curve_yaw_window_size
-        min_consecutive = self.curve_min_consecutive_changes
-        delta_min_rad = math.radians(self.curve_delta_angle_min_deg)
-        std_max_rad = math.radians(self.curve_delta_angle_std_max_deg)
-        total_min_rad = math.radians(self.curve_total_angle_min_deg)
-        opening_yaw_rad = math.radians(self.curve_opening_yaw_deg)
-        opening_yaw_max_rad = math.radians(self.curve_opening_yaw_max_deg)
+        window_size = self.curve_detection_window
+        min_consec = self.curve_min_consecutive_angle_changes
+        delta_min = math.radians(self.curve_delta_angle_min_deg)
+        std_max = math.radians(self.curve_delta_angle_std_max_deg)
+        total_min = math.radians(self.curve_total_angle_min_deg)
 
-        modified_count = 0
-        left_curves = 0
-        right_curves = 0
-
-        curve_offsets = np.zeros(N, dtype=np.float64)
-        curve_types = np.zeros(N, dtype=np.int8)  # 1 for left, -1 for right
-
-        # Pass 1: Detect curves and compute base offsets
+        is_curve_sg = [False] * N
         for i in range(1, N - 1):
-            # Extract a local window centered around i. 
             center_idx = i - 1
             half_w = window_size // 2
             start_idx = max(0, center_idx - half_w)
             end_idx = min(len(deltas), center_idx + half_w + 1)
+            wd = deltas[start_idx:end_idx]
+            if len(wd) == 0: continue
+
+            longest = []
+            curr = []
+            for d in wd:
+                if abs(d) >= delta_min:
+                    if not curr or np.sign(d) == np.sign(curr[0]):
+                        curr.append(d)
+                    else:
+                        if len(curr) > len(longest): longest = curr
+                        curr = [d]
+                else:
+                    if len(curr) > len(longest): longest = curr
+                    curr = []
+            if len(curr) > len(longest): longest = curr
+
+            if len(longest) >= min_consec:
+                if float(np.std(longest)) <= std_max and float(np.sum(np.abs(longest))) >= total_min:
+                    is_curve_sg[i] = True
+
+        new_semi_goals = [self.semi_goals[0]]
+        
+        def get_closest_path_idx(x, y, start_search=0):
+            best_idx = start_search
+            min_dist = float('inf')
+            for idx in range(start_search, len(path_msg.poses)):
+                px = path_msg.poses[idx].pose.position.x
+                py = path_msg.poses[idx].pose.position.y
+                dist = (px - x)**2 + (py - y)**2
+                if dist < min_dist:
+                    min_dist = dist
+                    best_idx = idx
+                elif dist > min_dist + 1.0: # Early exit since path is ordered
+                    break
+            return best_idx
+
+        last_path_idx = 0
+        inserted_points = 0
+        unsafe_segments = 0
+
+        for i in range(len(self.semi_goals) - 1):
+            P1 = self.semi_goals[i]
+            P2 = self.semi_goals[i+1]
             
-            window_deltas = deltas[start_idx:end_idx]
-            if len(window_deltas) == 0:
+            in_curve = is_curve_sg[i] or is_curve_sg[i+1]
+            dist = math.sqrt((P2[0]-P1[0])**2 + (P2[1]-P1[1])**2)
+            
+            needs_interpolation = False
+            
+            if in_curve and dist > self.max_curve_segment_length_m:
+                needs_interpolation = True
+            
+            if not needs_interpolation:
+                if not self._is_segment_lane_safe(P1[0], P1[1], P2[0], P2[1], step=self.curve_segment_check_step_m):
+                    needs_interpolation = True
+                    unsafe_segments += 1
+            
+            if needs_interpolation:
+                idx1 = get_closest_path_idx(P1[0], P1[1], last_path_idx)
+                idx2 = get_closest_path_idx(P2[0], P2[1], idx1)
+                last_path_idx = idx2
+                
+                subpath = path_msg.poses[idx1:idx2+1]
+                if len(subpath) >= 2:
+                    spacing = self.curve_semigoal_spacing_m
+                    consumed = 0.0
+                    accum = 0.0
+                    for k in range(1, len(subpath)):
+                        ax = subpath[k-1].pose.position.x
+                        ay = subpath[k-1].pose.position.y
+                        bx = subpath[k].pose.position.x
+                        by = subpath[k].pose.position.y
+                        seg_dx = bx - ax
+                        seg_dy = by - ay
+                        seg_len = math.sqrt(seg_dx*seg_dx + seg_dy*seg_dy)
+                        
+                        if seg_len < 1e-9: continue
+                        ux, uy = seg_dx/seg_len, seg_dy/seg_len
+                        
+                        rem = spacing - accum
+                        cons = 0.0
+                        while cons + rem <= seg_len:
+                            cons += rem
+                            px = ax + ux * cons
+                            py = ay + uy * cons
+                            new_semi_goals.append((px, py, 0.0))
+                            inserted_points += 1
+                            accum = 0.0
+                            rem = spacing
+                        accum += (seg_len - cons)
+                        
+            new_semi_goals.append(P2)
+            
+        self.semi_goals = new_semi_goals
+        if inserted_points > 0:
+            self.get_logger().info(f'[CURVE_SAFE_SPACING] Inserted {inserted_points} points. Repaired {unsafe_segments} unsafe segments.')
+
+    def _get_right_clearance(self, x, y, yaw):
+        dx = math.sin(yaw)
+        dy = -math.cos(yaw)
+        dist = 0.0
+        max_dist = self.right_boundary_check_distance_m
+        step = self.right_boundary_check_step_m
+        while dist <= max_dist:
+            px = x + dx * dist
+            py = y + dy * dist
+            col, row = self._world_to_grid(px, py)
+            if not self._in_bounds(col, row):
+                return dist
+            
+            if self.latest_layers is not None and 'occupancy' in self.latest_layers:
+                if self.latest_layers['occupancy'][row, col] > getattr(self, 'occupancy_threshold', 50):
+                    return dist
+                
+            if self.use_independent_lanes and self.lanes_loaded and self.lane_grids:
+                in_lane = False
+                for ldata in self.lane_grids.values():
+                    if ldata['mask'][row, col] > 0.5:
+                        in_lane = True
+                        break
+                if not in_lane:
+                    return dist
+            elif getattr(self, 'enforce_lane_mask', False) and self.latest_layers is not None:
+                global_mask = self.latest_layers.get('lane_mask', None)
+                if global_mask is not None and global_mask[row, col] < 0.5:
+                    return dist
+                    
+            dist += step
+        return max_dist
+
+    def _apply_ackermann_curve_yaw_offset(self):
+        N = len(self.semi_goals)
+        if N < 4: return
+
+        headings = np.zeros(N - 1, dtype=np.float64)
+        for j in range(N - 1):
+            sx, sy, _ = self.semi_goals[j]
+            nx, ny, _ = self.semi_goals[j + 1]
+            headings[j] = math.atan2(ny - sy, nx - sx)
+
+        deltas = np.zeros(N - 2, dtype=np.float64)
+        for j in range(1, N - 1):
+            deltas[j - 1] = self._normalize_angle(headings[j] - headings[j - 1])
+
+        window_size = self.curve_detection_window
+        min_consec = self.curve_min_consecutive_angle_changes
+        delta_min = math.radians(self.curve_delta_angle_min_deg)
+        std_max = math.radians(self.curve_delta_angle_std_max_deg)
+        total_min = math.radians(self.curve_total_angle_min_deg)
+
+        curve_types = np.zeros(N, dtype=np.int8)
+        blocks = []
+
+        i = 1
+        while i < N - 1:
+            center_idx = i - 1
+            half_w = window_size // 2
+            start_idx = max(0, center_idx - half_w)
+            end_idx = min(len(deltas), center_idx + half_w + 1)
+            wd = deltas[start_idx:end_idx]
+            if len(wd) == 0:
+                i += 1
                 continue
 
-            longest_seq = []
-            current_seq = []
-            for d in window_deltas:
-                if abs(d) >= delta_min_rad:
-                    if not current_seq:
-                        current_seq.append(d)
+            longest = []
+            curr = []
+            for d in wd:
+                if abs(d) >= delta_min:
+                    if not curr or np.sign(d) == np.sign(curr[0]):
+                        curr.append(d)
                     else:
-                        if np.sign(d) == np.sign(current_seq[0]):
-                            current_seq.append(d)
-                        else:
-                            if len(current_seq) > len(longest_seq):
-                                longest_seq = current_seq
-                            current_seq = [d]
+                        if len(curr) > len(longest): longest = curr
+                        curr = [d]
                 else:
-                    if len(current_seq) > len(longest_seq):
-                        longest_seq = current_seq
-                    current_seq = []
-            if len(current_seq) > len(longest_seq):
-                longest_seq = current_seq
+                    if len(curr) > len(longest): longest = curr
+                    curr = []
+            if len(curr) > len(longest): longest = curr
 
-            if len(longest_seq) >= min_consecutive:
-                std_dev = float(np.std(longest_seq))
-                abs_sum = float(np.sum(np.abs(longest_seq)))
-                if std_dev <= std_max_rad and abs_sum >= total_min_rad:
-                    avg_sign = np.sign(longest_seq[0])
-                    if avg_sign > 0:
-                        curve_offsets[i] = -opening_yaw_rad
-                        curve_types[i] = 1
+            if len(longest) >= min_consec:
+                if float(np.std(longest)) <= std_max and float(np.sum(np.abs(longest))) >= total_min:
+                    avg_sign = np.sign(longest[0])
+                    curve_types[i] = 1 if avg_sign > 0 else -1
+            i += 1
+
+        in_block = False
+        start_b = 0
+        for i in range(N):
+            if curve_types[i] != 0 and not in_block:
+                in_block = True
+                start_b = i
+            elif curve_types[i] == 0 and in_block:
+                in_block = False
+                if i - start_b >= 2:
+                    blocks.append((start_b, i - 1, curve_types[start_b]))
+            elif curve_types[i] != 0 and in_block and curve_types[i] != curve_types[i-1]:
+                if i - start_b >= 2:
+                    blocks.append((start_b, i - 1, curve_types[start_b]))
+                start_b = i
+        if in_block and N - start_b >= 2:
+            blocks.append((start_b, N - 1, curve_types[start_b]))
+
+        yaw_offsets = np.zeros(N, dtype=np.float64)
+        ramp_in = self.curve_yaw_ramp_in_ratio
+        ramp_out = self.curve_yaw_ramp_out_ratio
+        max_deg = self.curve_yaw_offset_max_deg
+        min_deg = self.curve_yaw_offset_min_deg
+
+        def smoothstep(edge0, edge1, x):
+            x = max(0.0, min(1.0, (x - edge0) / (edge1 - edge0)))
+            return x * x * (3 - 2 * x)
+
+        modified_count = 0
+        
+        for start_idx, end_idx, ctype in blocks:
+            length = end_idx - start_idx
+            for k in range(start_idx, end_idx + 1):
+                phase = (k - start_idx) / float(max(length, 1))
+                gain = 1.0
+                if phase < ramp_in and ramp_in > 0:
+                    gain = smoothstep(0.0, 1.0, phase / ramp_in)
+                elif phase > 1.0 - ramp_out and ramp_out > 0:
+                    gain = smoothstep(0.0, 1.0, (1.0 - phase) / ramp_out)
+
+                offset_mag = min_deg + gain * (max_deg - min_deg)
+                
+                if self.use_right_boundary_adaptive_opening:
+                    x, y, yaw_base = self.semi_goals[k]
+                    clearance = self._get_right_clearance(x, y, yaw_base)
+                    near_m = self.right_boundary_near_m
+                    far_m = self.right_boundary_far_m
+                    
+                    if clearance <= near_m:
+                        b_gain = 1.0
+                    elif clearance >= far_m:
+                        b_gain = 0.0
                     else:
-                        curve_offsets[i] = opening_yaw_rad
-                        curve_types[i] = -1
+                        b_gain = 1.0 - (clearance - near_m) / max(1e-6, far_m - near_m)
+                        
+                    if b_gain == 0.0:
+                        offset_mag = self.minimum_opening_if_no_right_boundary_deg
+                    else:
+                        offset_mag = offset_mag * b_gain
+                
+                yaw_offsets[k] = -offset_mag if ctype == 1 else offset_mag
 
-        # Pass 2: Anticipate (Propagate backwards)
-        anticipation = self.curve_anticipation_points
-        if anticipation > 0:
-            anticipated_offsets = curve_offsets.copy()
-            anticipated_types = curve_types.copy()
-            for i in range(1, N - 1):
-                if curve_offsets[i] == 0.0:
-                    for lookahead in range(1, anticipation + 1):
-                        idx = i + lookahead
-                        if idx < N - 1 and curve_offsets[idx] != 0.0:
-                            anticipated_offsets[i] = curve_offsets[idx]
-                            anticipated_types[i] = curve_types[idx]
-                            break
-            curve_offsets = anticipated_offsets
-            curve_types = anticipated_types
+        rate_limit = self.curve_yaw_rate_limit_deg
+        for i in range(1, N):
+            diff = yaw_offsets[i] - yaw_offsets[i-1]
+            if abs(diff) > rate_limit:
+                yaw_offsets[i] = yaw_offsets[i-1] + np.sign(diff) * rate_limit
 
-        # Pass 3: Apply offsets
         for i in range(1, N - 1):
-            if curve_offsets[i] != 0.0:
+            if abs(yaw_offsets[i]) > 1e-3:
                 x, y, yaw_base = self.semi_goals[i]
-                yaw_open = yaw_base + curve_offsets[i]
-                
-                # Clamp offset
-                if abs(self._normalize_angle(yaw_open - yaw_base)) > opening_yaw_max_rad:
-                    yaw_open = yaw_base + np.sign(curve_offsets[i]) * opening_yaw_max_rad
-                
-                self.semi_goals[i] = (x, y, self._normalize_angle(yaw_open))
+                yaw_open = self._normalize_angle(yaw_base + math.radians(yaw_offsets[i]))
+                self.semi_goals[i] = (x, y, yaw_open)
                 modified_count += 1
-                if curve_types[i] == 1:
-                    left_curves += 1
-                elif curve_types[i] == -1:
-                    right_curves += 1
+
+        self.get_logger().info(f'[ACKERMANN_YAW] Analyzed {N} semi-goals. Modified {modified_count} across {len(blocks)} curves.')
+
+    # =====================================================================
+    # Semi-Goal Yaw Validation & Repair
+    # =====================================================================
+    def _validate_and_repair_semigoal_yaws(self):
+        """
+        Final-stage robust yaw validation. Recalculates orientations using
+        local tangents from valid-distance neighbours, detects jumps beyond
+        max_yaw_jump_deg, repairs them, and optionally smooths small changes.
+        Never moves (x, y) positions. Never deletes semi-goals.
+        """
+        N = len(self.semi_goals)
+        if N < 2:
+            return
+
+        min_dist = self.min_yaw_segment_distance_m
+        max_jump_rad = math.radians(self.max_yaw_jump_deg)
+        window = self.yaw_smoothing_window
+        preserve_final = self.preserve_final_goal_yaw
+        do_repair = self.repair_bad_yaw_using_neighbors
+
+        # ── Step 1: Compute robust yaw_base for every point ──────────────
+        # For each point i, find forward/backward neighbours that are
+        # at least min_dist away, then compute tangent-based yaw.
+
+        yaw_base = [0.0] * N
+        skipped_pairs = 0
+
+        def _dist(a, b):
+            return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+        for i in range(N):
+            xi, yi, _ = self.semi_goals[i]
+
+            # Search forward for a valid neighbour
+            fwd_idx = None
+            for j in range(i + 1, N):
+                if _dist(self.semi_goals[i], self.semi_goals[j]) >= min_dist:
+                    fwd_idx = j
+                    break
+
+            # Search backward for a valid neighbour
+            bwd_idx = None
+            for j in range(i - 1, -1, -1):
+                if _dist(self.semi_goals[i], self.semi_goals[j]) >= min_dist:
+                    bwd_idx = j
+                    break
+
+            if fwd_idx is not None and bwd_idx is not None:
+                # Central tangent: P_prev → P_next
+                px, py, _ = self.semi_goals[bwd_idx]
+                nx, ny, _ = self.semi_goals[fwd_idx]
+                yaw_base[i] = math.atan2(ny - py, nx - px)
+            elif fwd_idx is not None:
+                # Forward-only tangent: P_i → P_next
+                nx, ny, _ = self.semi_goals[fwd_idx]
+                yaw_base[i] = math.atan2(ny - yi, nx - xi)
+            elif bwd_idx is not None:
+                # Backward-only tangent: P_prev → P_i
+                px, py, _ = self.semi_goals[bwd_idx]
+                yaw_base[i] = math.atan2(yi - py, xi - px)
+            else:
+                # No valid neighbour at all — keep current yaw
+                yaw_base[i] = self.semi_goals[i][2]
+                skipped_pairs += 1
+                self.get_logger().warn(
+                    f'[YAW_VALIDATION] Point {i} has no valid neighbour '
+                    f'(all within {min_dist}m) — keeping original yaw.'
+                )
+
+        # ── Step 2: Detect and repair invalid yaws ───────────────────────
+        invalid_count = 0
+        repaired_count = 0
+        last_valid_idx = N - 1 if preserve_final else N
+
+        for i in range(N):
+            # Skip the final goal if we're preserving it
+            if preserve_final and i == N - 1:
+                continue
+
+            x, y, yaw_current = self.semi_goals[i]
+            diff = abs(self._normalize_angle(yaw_current - yaw_base[i]))
+
+            if diff > max_jump_rad:
+                invalid_count += 1
+                if do_repair:
+                    self.get_logger().debug(
+                        f'[YAW_VALIDATION] Repaired point {i}: '
+                        f'yaw_orig={math.degrees(yaw_current):.1f}° → '
+                        f'yaw_base={math.degrees(yaw_base[i]):.1f}° '
+                        f'(jump={math.degrees(diff):.1f}°)'
+                    )
+                    self.semi_goals[i] = (x, y, self._normalize_angle(yaw_base[i]))
+                    repaired_count += 1
+                else:
+                    self.get_logger().warn(
+                        f'[YAW_VALIDATION] Invalid yaw at point {i}: '
+                        f'yaw={math.degrees(yaw_current):.1f}°, '
+                        f'yaw_base={math.degrees(yaw_base[i]):.1f}°, '
+                        f'jump={math.degrees(diff):.1f}° — NOT repaired (repair disabled).'
+                    )
+
+        # ── Step 3: Optional angular smoothing ───────────────────────────
+        if window >= 3 and N >= window:
+            smoothed_yaws = [self.semi_goals[i][2] for i in range(N)]
+            half_w = window // 2
+
+            smooth_end = (N - 1) if preserve_final else N
+
+            for i in range(1, smooth_end):
+                start_j = max(0, i - half_w)
+                end_j = min(N, i + half_w + 1)
+
+                # Collect neighbour yaws relative to current to handle wrapping
+                ref = smoothed_yaws[i]
+                total = 0.0
+                count = 0
+                for j in range(start_j, end_j):
+                    d = self._normalize_angle(smoothed_yaws[j] - ref)
+                    total += d
+                    count += 1
+
+                if count > 0:
+                    avg_offset = total / count
+                    candidate = self._normalize_angle(ref + avg_offset)
+
+                    # Only apply smoothing if it does NOT create a big jump
+                    # relative to the raw yaw_base direction
+                    base_diff = abs(self._normalize_angle(candidate - yaw_base[i]))
+                    if base_diff <= max_jump_rad:
+                        smoothed_yaws[i] = candidate
+
+            # Write smoothed yaws back
+            for i in range(1, smooth_end):
+                x, y, _ = self.semi_goals[i]
+                self.semi_goals[i] = (x, y, smoothed_yaws[i])
+
+        # ── Step 4: Final goal yaw check ─────────────────────────────────
+        final_yaw_warning = 0
+        if N >= 2:
+            x_last, y_last, yaw_last = self.semi_goals[-1]
+            # Compare final yaw against the direction from penultimate to last
+            x_pen, y_pen, _ = self.semi_goals[-2]
+            d_final = _dist(self.semi_goals[-2], self.semi_goals[-1])
+            if d_final >= min_dist:
+                path_dir = math.atan2(y_last - y_pen, x_last - x_pen)
+                final_diff = abs(self._normalize_angle(yaw_last - path_dir))
+                if final_diff > max_jump_rad:
+                    final_yaw_warning = 1
+                    if preserve_final:
+                        self.get_logger().warn(
+                            f'[YAW_VALIDATION] Final goal yaw differs strongly '
+                            f'from path direction: goal_yaw={math.degrees(yaw_last):.1f}°, '
+                            f'path_dir={math.degrees(path_dir):.1f}°, '
+                            f'diff={math.degrees(final_diff):.1f}° — preserved as requested.'
+                        )
+                    else:
+                        self.semi_goals[-1] = (x_last, y_last, self._normalize_angle(path_dir))
+                        repaired_count += 1
+
+        # ── Logging ──────────────────────────────────────────────────────
+        self.get_logger().info(
+            f'[YAW_VALIDATION] N={N}, skipped_pairs={skipped_pairs}, '
+            f'invalid_detected={invalid_count}, repaired={repaired_count}, '
+            f'final_yaw_warnings={final_yaw_warning}'
+        )
+
+
+    # =====================================================================
+    # Semi-Goal Sanitizer  (distance filter + duplicate removal)
+    # =====================================================================
+    def _sanitize_semigoals_before_publish(self):
+        """
+        Final obligatory cleanup before publishing semi-goals to Nav2.
+        1) Remove exact duplicates (within epsilon).
+        2) Remove too-close points (unless removal breaks lane safety).
+        3) Multi-iteration pass to catch cascading close pairs.
+        4) Recalculate all yaws robustly.
+        """
+        N_before = len(self.semi_goals)
+        if N_before < 2:
+            return
+
+        eps = self.duplicate_semigoal_epsilon_m
+        min_dist = self.min_semigoal_distance_m
+        min_dist_curve = self.min_semigoal_distance_curve_m
+        max_iters = self.max_semigoal_filter_iterations
+        max_removals = self.max_semigoals_removed_per_path
+        preserve_first = self.preserve_first_semigoal
+        preserve_final = self.preserve_final_goal
+
+        total_duplicates = 0
+        total_too_close = 0
+        total_kept_for_safety = 0
+        total_removed = 0
+
+        def _dist(a, b):
+            return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+        for iteration in range(max_iters):
+            if len(self.semi_goals) < 3:
+                break
+
+            filtered = []
+            removed_this_iter = 0
+            N = len(self.semi_goals)
+
+            # Always keep the first point
+            filtered.append(self.semi_goals[0])
+
+            for i in range(1, N):
+                # Always keep the last point
+                if preserve_final and i == N - 1:
+                    filtered.append(self.semi_goals[i])
+                    continue
+
+                # Don't remove if we've hit the removal limit
+                if total_removed >= max_removals:
+                    filtered.append(self.semi_goals[i])
+                    continue
+
+                prev = filtered[-1]
+                curr = self.semi_goals[i]
+                d = _dist(prev, curr)
+
+                # Case 1: exact duplicate
+                if d < eps:
+                    total_duplicates += 1
+                    total_removed += 1
+                    removed_this_iter += 1
+                    continue
+
+                # Case 2: too close — use curve distance if available
+                threshold = min_dist_curve if d < min_dist else min_dist
+                if d < threshold:
+                    # Check if skipping this point keeps lane safety
+                    # Look ahead to find the next point that will be kept
+                    next_kept = None
+                    for j in range(i + 1, N):
+                        next_kept = self.semi_goals[j]
+                        break
+
+                    if next_kept is not None:
+                        safe = self._is_segment_lane_safe(
+                            prev[0], prev[1], next_kept[0], next_kept[1],
+                            step=0.02
+                        )
+                        if safe:
+                            total_too_close += 1
+                            total_removed += 1
+                            removed_this_iter += 1
+                            continue
+                        else:
+                            total_kept_for_safety += 1
+
+                filtered.append(curr)
+
+            self.semi_goals = filtered
+
+            if removed_this_iter == 0:
+                break
+
+        # ── Final duplicate sweep ────────────────────────────────────────
+        if len(self.semi_goals) >= 3:
+            final_filtered = [self.semi_goals[0]]
+            for i in range(1, len(self.semi_goals)):
+                if _dist(final_filtered[-1], self.semi_goals[i]) >= eps:
+                    final_filtered.append(self.semi_goals[i])
+                else:
+                    if preserve_final and i == len(self.semi_goals) - 1:
+                        final_filtered.append(self.semi_goals[i])
+                    else:
+                        total_duplicates += 1
+                        total_removed += 1
+            self.semi_goals = final_filtered
+
+        # ── Robust yaw recalculation ─────────────────────────────────────
+        self._recompute_semigoal_yaws_robust()
+
+        # ── Compute stats ────────────────────────────────────────────────
+        N_after = len(self.semi_goals)
+        min_final_dist = float('inf')
+        for i in range(1, N_after):
+            d = _dist(self.semi_goals[i-1], self.semi_goals[i])
+            if d < min_final_dist:
+                min_final_dist = d
 
         self.get_logger().info(
-            f'[CURVE_YAW_OPENING] Analyzed {N} semi-goals. Modified {modified_count} '
-            f'(Left curves: {left_curves}, Right curves: {right_curves})'
+            f'[SANITIZER] Before={N_before}, After={N_after}, '
+            f'duplicates={total_duplicates}, too_close={total_too_close}, '
+            f'kept_for_safety={total_kept_for_safety}, '
+            f'total_removed={total_removed}, '
+            f'min_final_dist={min_final_dist:.4f}m'
         )
+
+        if min_final_dist < eps and N_after > 2:
+            self.get_logger().warn(
+                f'[SANITIZER] Warning: min distance {min_final_dist:.4f}m '
+                f'is below epsilon {eps}m — some close points could not be '
+                f'removed for lane-safety reasons.'
+            )
+
+    # =====================================================================
+    # Robust Yaw Recalculation
+    # =====================================================================
+    def _recompute_semigoal_yaws_robust(self):
+        """
+        Recalculate all semi-goal yaws using valid-distance tangent neighbours.
+        - Ignores pairs closer than min_semigoal_distance_curve_m for atan2.
+        - Uses central tangent (P_prev→P_next) when both neighbours valid.
+        - Falls back to unilateral tangent.
+        - Preserves final goal yaw if configured.
+        - Never moves (x,y) positions.
+        """
+        N = len(self.semi_goals)
+        if N < 2:
+            return
+
+        min_dist = getattr(self, 'min_semigoal_distance_curve_m', 0.08)
+        preserve_final = getattr(self, 'preserve_final_goal', True)
+        yaw_repaired = 0
+
+        def _dist(a, b):
+            return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+        for i in range(N):
+            # Skip the last point if preserving final goal yaw
+            if preserve_final and i == N - 1:
+                continue
+
+            xi, yi, yaw_old = self.semi_goals[i]
+
+            # Search forward for a valid neighbour
+            fwd_idx = None
+            for j in range(i + 1, N):
+                if _dist(self.semi_goals[i], self.semi_goals[j]) >= min_dist:
+                    fwd_idx = j
+                    break
+
+            # Search backward for a valid neighbour
+            bwd_idx = None
+            for j in range(i - 1, -1, -1):
+                if _dist(self.semi_goals[i], self.semi_goals[j]) >= min_dist:
+                    bwd_idx = j
+                    break
+
+            yaw_new = yaw_old  # default: keep
+
+            if fwd_idx is not None and bwd_idx is not None:
+                px, py, _ = self.semi_goals[bwd_idx]
+                nx, ny, _ = self.semi_goals[fwd_idx]
+                yaw_new = math.atan2(ny - py, nx - px)
+            elif fwd_idx is not None:
+                nx, ny, _ = self.semi_goals[fwd_idx]
+                yaw_new = math.atan2(ny - yi, nx - xi)
+            elif bwd_idx is not None:
+                px, py, _ = self.semi_goals[bwd_idx]
+                yaw_new = math.atan2(yi - py, xi - px)
+
+            yaw_new = self._normalize_angle(yaw_new)
+
+            if abs(self._normalize_angle(yaw_new - yaw_old)) > 1e-3:
+                yaw_repaired += 1
+
+            self.semi_goals[i] = (xi, yi, yaw_new)
+
+        if yaw_repaired > 0:
+            self.get_logger().info(
+                f'[SANITIZER_YAW] Recalculated {yaw_repaired}/{N} yaws using robust tangent.'
+            )
 
     # =====================================================================
     # Lane-safety check for a straight segment
     # =====================================================================
-    def _is_segment_lane_safe(self, x1, y1, x2, y2):
+    def _is_segment_lane_safe(self, x1, y1, x2, y2, step=None):
         """Return True if all sampled points along (x1,y1)→(x2,y2) lie
         inside a valid lane mask (or inside the map if no lanes loaded).
-        Sampling step is semigoal_segment_check_step_m."""
-        step = self.semigoal_segment_check_step_m
+        Sampling step is semigoal_segment_check_step_m unless overridden."""
+        if step is None:
+            step = getattr(self, 'semigoal_segment_check_step_m', 0.02)
         dx = x2 - x1
         dy = y2 - y1
         seg_len = math.sqrt(dx * dx + dy * dy)
@@ -2648,9 +3279,10 @@ class DirectionalPlannerServer(Node):
             m.pose.position.x = float(sx)
             m.pose.position.y = float(sy)
             m.pose.position.z = 0.3
-            m.scale.x = 0.25
-            m.scale.y = 0.25
-            m.scale.z = 0.25
+            _sc = getattr(self, 'semigoal_marker_scale', 0.12)
+            m.scale.x = _sc
+            m.scale.y = _sc
+            m.scale.z = _sc
 
             if i < self.current_sg_idx:
                 # Reached → dim green

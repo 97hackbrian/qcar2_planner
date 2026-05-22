@@ -75,35 +75,34 @@ directional_planner_server:
     # semi_goal_tolerance: Precision con la que Nav2 debe atinar al punto antes de pasar al siguiente. Subir: Movimiento ininterrumpido (pasa "cerca" y avanza). Bajar: El coche se frena intentando cuadrarse exacto en cada punto.
     semi_goal_tolerance: 0.26
     
-    # --- Adaptive Semi-Goal Spacing ---
-    # use_adaptive_semigoal_spacing: [true/false] Si es true, ajusta dinámicamente la distancia entre semi-goals dependiendo de si el tramo es recto o curvo.
-    use_adaptive_semigoal_spacing: false
-    # straight_semigoal_spacing_m: Espaciado usado en rectas (suele ser mayor para avance rápido).
-    straight_semigoal_spacing_m: 0.43
-    # curve_semigoal_spacing_m: Espaciado usado en curvas (más denso para evitar que el coche corte por dentro de la curva).
-    curve_semigoal_spacing_m: 0.43
-    # curve_spacing_angle_threshold_deg: Ángulo umbral para considerar que un tramo del path es una curva.
-    curve_spacing_angle_threshold_deg: 15.0
+    # --- Curve Safe Semigoal Spacing ---
+    # use_curve_safe_semigoal_spacing: [true/false] Si es true, ajusta dinámicamente la distancia en curvas y verifica segmentos para evitar cortar esquinas.
+    use_curve_safe_semigoal_spacing: true
+    straight_semigoal_spacing_m: 0.35
+    curve_semigoal_spacing_m: 0.18
+    max_curve_segment_length_m: 0.22
+    curve_segment_check_step_m: 0.02
 
-    # --- Curve Yaw Opening (modifica orientación de semi-goals en curvas) ---
-    # use_curve_yaw_opening: [true/false] Si es true, abre la orientación (yaw) de los semi-goals en curvas opuesta al giro.
-    use_curve_yaw_opening: true
-    # curve_yaw_window_size: Tamaño de la ventana local para analizar cambios de ángulo (cantidad de puntos).
-    curve_yaw_window_size: 4
-    # curve_min_consecutive_changes: Mínimo de cambios consecutivos con el mismo signo para ser curva.
-    curve_min_consecutive_changes: 4
-    # curve_delta_angle_min_deg: Cambio mínimo (grados) entre segmentos para sumarlo a la detección de curva.
-    curve_delta_angle_min_deg: 4.0
-    # curve_delta_angle_std_max_deg: Desviación estándar máxima permitida en la ventana para considerar curva suave.
+    # --- Ackermann Curve Yaw Offset ---
+    use_ackermann_curve_yaw_offset: true
+    curve_detection_window: 5
+    curve_min_consecutive_angle_changes: 3
+    curve_delta_angle_min_deg: 3.0
     curve_delta_angle_std_max_deg: 8.0
-    # curve_total_angle_min_deg: Suma absoluta mínima de ángulos en la ventana para ser curva.
-    curve_total_angle_min_deg: 15.0
-    # curve_opening_yaw_deg: Ángulo de apertura a aplicar al yaw base.
-    curve_opening_yaw_deg: 12.0
-    # curve_opening_yaw_max_deg: Tope máximo del offset de yaw.
-    curve_opening_yaw_max_deg: 12.0
-    # curve_anticipation_points: Puntos previos a la curva a los que se les propagará la apertura de yaw (anticipación).
-    curve_anticipation_points: 1
+    curve_total_angle_min_deg: 12.0
+    
+    curve_yaw_offset_max_deg: 7.0
+    curve_yaw_offset_min_deg: 1.0
+    curve_yaw_ramp_in_ratio: 0.45
+    curve_yaw_ramp_out_ratio: 0.45
+    curve_yaw_rate_limit_deg: 2.5
+    
+    use_right_boundary_adaptive_opening: true
+    right_boundary_check_distance_m: 0.35
+    right_boundary_near_m: 0.12
+    right_boundary_far_m: 0.35
+    right_boundary_check_step_m: 0.02
+    minimum_opening_if_no_right_boundary_deg: 0.0
 
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
@@ -163,6 +162,40 @@ directional_planner_server:
     max_zigzag_fix_shift_m: 0.08
     # semigoal_segment_check_step_m: Paso (metros) para muestrear puntos al validar que un segmento es lane-safe. Subir: Validacion mas rapida pero menos precisa. Bajar: Validacion exhaustiva celda por celda.
     semigoal_segment_check_step_m: 0.02
+
+    # --- Semi-Goal Yaw Validation (reparación robusta de orientación antes de publicar) ---
+    # use_semigoal_yaw_validation: [true/false] Si es true, recalcula y repara orientaciones de semi-goals usando tangentes locales robustas. Corrige flechas perpendiculares, invertidas o aleatorias causadas por puntos sobrelapados o filtros previos.
+    use_semigoal_yaw_validation: true
+    # min_yaw_segment_distance_m: Distancia mínima (metros) entre dos puntos para considerar su atan2 confiable. Pares más cercanos se ignoran y se busca un vecino más lejano.
+    min_yaw_segment_distance_m: 0.08
+    # max_yaw_jump_deg: Salto máximo (grados) entre el yaw actual y el yaw_base calculado por tangente. Si se excede, el yaw se marca como inválido y se repara.
+    max_yaw_jump_deg: 45.0
+    # yaw_smoothing_window: Ventana de suavizado angular. Solo suaviza cambios pequeños; nunca introduce saltos mayores a max_yaw_jump_deg.
+    yaw_smoothing_window: 3
+    # preserve_final_goal_yaw: [true/false] Si es true, conserva la orientación exacta del goal final sin modificarla, pero loggea warning si difiere mucho de la trayectoria.
+    preserve_final_goal_yaw: true
+    # repair_bad_yaw_using_neighbors: [true/false] Si es true, reemplaza yaw inválidos con yaw_base de tangente local. Si es false, solo loggea warning sin corregir.
+    repair_bad_yaw_using_neighbors: true
+
+    # --- Semi-Goal Sanitizer (limpieza final obligatoria antes de publicar) ---
+    # use_semigoal_sanitizer: [true/false] Si es true, elimina semi-goals duplicados o demasiado cercanos, valida lane-safety y recalcula yaw robusto. Siempre se ejecuta al final del pipeline.
+    use_semigoal_sanitizer: true
+    # min_semigoal_distance_m: Distancia mínima (metros) entre semi-goals consecutivos en rectas. Semi-goals más cercanos se descartan si el segmento resultante es lane-safe.
+    min_semigoal_distance_m: 0.22
+    # min_semigoal_distance_curve_m: Distancia mínima en curvas. Puede ser menor que en rectas para mantener resolución.
+    min_semigoal_distance_curve_m: 0.18
+    # duplicate_semigoal_epsilon_m: Distancia por debajo de la cual dos puntos se consideran duplicados y se descartan directamente.
+    duplicate_semigoal_epsilon_m: 0.04
+    # max_semigoal_filter_iterations: Iteraciones máximas del filtro de distancia. Más iteraciones = más limpieza.
+    max_semigoal_filter_iterations: 3
+    # max_semigoals_removed_per_path: Limite de semi-goals removidos por path para no despoblar la trayectoria.
+    max_semigoals_removed_per_path: 5
+    # preserve_first_semigoal: [true/false] Siempre conservar el primer semi-goal.
+    preserve_first_semigoal: true
+    # preserve_final_goal: [true/false] Siempre conservar el ultimo semi-goal (goal final).
+    preserve_final_goal: true
+    # semigoal_marker_scale: Escala visual (metros) de los markers de semi-goals en RViz.
+    semigoal_marker_scale: 0.12
 
 map_loader_node:
   ros__parameters:

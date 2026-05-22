@@ -21,7 +21,7 @@ options = {
   submap_publish_period_sec = 0.3,
   pose_publish_period_sec = 50e-3,
   trajectory_publish_period_sec = 30e-3,
-  rangefinder_sampling_ratio = 0.7,
+  rangefinder_sampling_ratio = 0.75,
   odometry_sampling_ratio = 1.,
   fixed_frame_pose_sampling_ratio = 1.,
   imu_sampling_ratio = 1.,
@@ -31,10 +31,10 @@ options = {
 MAP_BUILDER.use_trajectory_builder_2d = true
 
 -- ── Trajectory builder tuning ──────────────────────────────────
-TRAJECTORY_BUILDER_2D.min_range = 0.05
-TRAJECTORY_BUILDER_2D.max_range = 4.0
+TRAJECTORY_BUILDER_2D.min_range = 0.10
+TRAJECTORY_BUILDER_2D.max_range = 9.0
 TRAJECTORY_BUILDER_2D.missing_data_ray_length = 4.
-TRAJECTORY_BUILDER_2D.use_imu_data = false    -- ENABLE IMU FUSION
+TRAJECTORY_BUILDER_2D.use_imu_data = true    -- ENABLE IMU FUSION
 
 -- Since we rely on Lidar odometry, we need correlative scan matching to be effective
 TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true
@@ -58,7 +58,7 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.9
 TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(0.2)
 
 -- ── Pose graph (Loop Closure) ──────────────────────────────────
-POSE_GRAPH.optimize_every_n_nodes = 150
+POSE_GRAPH.optimize_every_n_nodes = 140
 POSE_GRAPH.constraint_builder.min_score = 0.65
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.70
 
