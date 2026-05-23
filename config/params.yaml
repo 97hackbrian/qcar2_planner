@@ -25,7 +25,7 @@ map_overlay_node:
     lanes_yaml_path: "/workspaces/isaac_ros-dev/ros2/src/qcar2_planner/config/lanes.yaml"  # set via launch arg or leave empty (auto-detects from map dir)
     
     # --- Publishing ---
-    publish_rate: 0.2
+    publish_rate: 0.1
     map_frame: "map"
     
     # --- Output Topics ---
@@ -230,7 +230,7 @@ map_loader_node:
     morph_kernel_size: 0 # kernel for opening + closing
 
     # --- Publishing ---
-    publish_rate: 0.2
+    publish_rate: 0.1
     map_frame: "map"
 
     # --- Output Topics ---
