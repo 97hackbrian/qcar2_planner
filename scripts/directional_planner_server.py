@@ -532,6 +532,20 @@ class DirectionalPlannerServer(Node):
         self.declare_parameter('post_curve_counteroffset_check_step_m', 0.02)
         self.declare_parameter('post_curve_counteroffset_direction', 'left')
 
+        self.declare_parameter('use_right_curve_protection', False)
+        self.declare_parameter('right_curve_protection_offset_m', 0.05)
+        self.declare_parameter('right_curve_protection_max_offset_m', 0.10)
+        self.declare_parameter('right_curve_protection_distance_m', 0.80)
+        self.declare_parameter('right_curve_protection_ramp_in_m', 0.20)
+        self.declare_parameter('right_curve_protection_ramp_out_m', 0.25)
+        self.declare_parameter('right_curve_angle_threshold_deg', 8.0)
+        self.declare_parameter('right_curve_min_total_angle_deg', 12.0)
+        self.declare_parameter('right_curve_boundary_trigger_m', 0.25)
+        self.declare_parameter('right_curve_check_step_m', 0.02)
+        self.declare_parameter('right_curve_apply_to_positions', True)
+        self.declare_parameter('right_curve_apply_to_yaw', False)
+        self.declare_parameter('right_curve_yaw_offset_deg', 3.0)
+
         # Edge Clearance Cost (optional soft penalty near lane edges)
         self.declare_parameter('use_edge_clearance_cost', False)
         self.declare_parameter('edge_clearance_weight', 0.08)
@@ -650,6 +664,30 @@ class DirectionalPlannerServer(Node):
         self.post_curve_right_boundary_trigger_m = float(self.get_parameter('post_curve_right_boundary_trigger_m').value)
         self.post_curve_counteroffset_check_step_m = float(self.get_parameter('post_curve_counteroffset_check_step_m').value)
         self.post_curve_counteroffset_direction = str(self.get_parameter('post_curve_counteroffset_direction').value)
+
+        self.use_right_curve_protection = bool(self.get_parameter('use_right_curve_protection').value)
+        self.right_curve_protection_offset_m = float(self.get_parameter('right_curve_protection_offset_m').value)
+        self.right_curve_protection_max_offset_m = float(self.get_parameter('right_curve_protection_max_offset_m').value)
+        self.right_curve_protection_distance_m = float(self.get_parameter('right_curve_protection_distance_m').value)
+        self.right_curve_protection_ramp_in_m = float(self.get_parameter('right_curve_protection_ramp_in_m').value)
+        self.right_curve_protection_ramp_out_m = float(self.get_parameter('right_curve_protection_ramp_out_m').value)
+        self.right_curve_angle_threshold_deg = float(self.get_parameter('right_curve_angle_threshold_deg').value)
+        self.right_curve_min_total_angle_deg = float(self.get_parameter('right_curve_min_total_angle_deg').value)
+        self.right_curve_boundary_trigger_m = float(self.get_parameter('right_curve_boundary_trigger_m').value)
+        self.right_curve_check_step_m = float(self.get_parameter('right_curve_check_step_m').value)
+        self.right_curve_apply_to_positions = bool(self.get_parameter('right_curve_apply_to_positions').value)
+        self.right_curve_apply_to_yaw = bool(self.get_parameter('right_curve_apply_to_yaw').value)
+        self.right_curve_yaw_offset_deg = float(self.get_parameter('right_curve_yaw_offset_deg').value)
+
+        rcp_state = 'ACTIVE' if self.use_right_curve_protection else 'INACTIVE'
+        self.get_logger().info(
+            f'[RIGHT_CURVE_PROT] {rcp_state}: '
+            f'offset={self.right_curve_protection_offset_m}m, '
+            f'max={self.right_curve_protection_max_offset_m}m, '
+            f'trigger={self.right_curve_boundary_trigger_m}m, '
+            f'apply_pos={self.right_curve_apply_to_positions}, '
+            f'apply_yaw={self.right_curve_apply_to_yaw}'
+        )
 
         # Edge Clearance Cost
         self.use_edge_clearance_cost = bool(self.get_parameter('use_edge_clearance_cost').value)
@@ -2347,6 +2385,10 @@ class DirectionalPlannerServer(Node):
         if getattr(self, 'use_post_curve_straight_counteroffset', False):
             self._apply_post_curve_straight_counteroffset()
 
+        # ── Right Curve Protection ──────────────────────────────────────
+        if getattr(self, 'use_right_curve_protection', False):
+            self._apply_right_curve_protection()
+
         # ── Yaw Validation & Repair (final stage) ───────────────────────
         if getattr(self, 'use_semigoal_yaw_validation', False):
             self._validate_and_repair_semigoal_yaws()
@@ -2864,6 +2906,216 @@ class DirectionalPlannerServer(Node):
             f'modified_points={modified_count}, '
             f'rejected_safe={rejected_lane_safe}, '
             f'rejected_no_boundary={rejected_no_boundary}'
+        )
+
+    # =====================================================================
+    # Right Curve Protection
+    # =====================================================================
+    def _apply_right_curve_protection(self):
+        """
+        Applies a lateral leftward offset ONLY to semi-goals inside
+        right-hand curves, to keep the QCar from hugging the inner
+        boundary/sidewalk.  Left curves are completely untouched.
+        """
+        N = len(self.semi_goals)
+        if N < 5:
+            return
+
+        # ── Compute headings and deltas ──────────────────────────────────
+        headings = [0.0] * (N - 1)
+        for j in range(N - 1):
+            sx, sy, _ = self.semi_goals[j]
+            nx, ny, _ = self.semi_goals[j + 1]
+            headings[j] = math.atan2(ny - sy, nx - sx)
+
+        deltas = [0.0] * (N - 2)
+        for j in range(N - 2):
+            deltas[j] = self._normalize_angle(headings[j + 1] - headings[j])
+
+        # ── Detect right-curve blocks (negative delta = turning right) ───
+        angle_thresh_rad = math.radians(self.right_curve_angle_threshold_deg)
+        total_min_rad = math.radians(self.right_curve_min_total_angle_deg)
+        window = getattr(self, 'curve_detection_window', 5)
+        min_consec = getattr(self, 'curve_min_consecutive_angle_changes', 3)
+
+        right_curve_mask = [False] * N
+        right_blocks = []  # list of (start, end) index pairs
+
+        i = 0
+        while i <= len(deltas) - window:
+            window_slice = deltas[i:i + window]
+
+            # Count consistent negative deltas (right turn)
+            consec_neg = 0
+            longest_neg = []
+            current_neg = []
+            for d in window_slice:
+                if d < -0.01:  # negative = turning right
+                    current_neg.append(d)
+                    consec_neg += 1
+                else:
+                    if len(current_neg) > len(longest_neg):
+                        longest_neg = current_neg
+                    consec_neg = 0
+                    current_neg = []
+            if len(current_neg) > len(longest_neg):
+                longest_neg = current_neg
+
+            if (len(longest_neg) >= min_consec and
+                    sum(abs(d) for d in longest_neg) >= total_min_rad):
+                for k in range(i, min(i + window, N)):
+                    right_curve_mask[k] = True
+            i += 1
+
+        # ── Build contiguous blocks ──────────────────────────────────────
+        in_block = False
+        start_b = 0
+        for j in range(N):
+            if right_curve_mask[j] and not in_block:
+                in_block = True
+                start_b = j
+            elif not right_curve_mask[j] and in_block:
+                in_block = False
+                if j - start_b >= 2:
+                    right_blocks.append((start_b, j - 1))
+        if in_block and N - start_b >= 2:
+            right_blocks.append((start_b, N - 1))
+
+        left_curves_ignored = 0
+        # Count left curves for log (positive deltas)
+        left_mask = [False] * N
+        ii = 0
+        while ii <= len(deltas) - window:
+            ws = deltas[ii:ii + window]
+            cn = []
+            cur = []
+            for d in ws:
+                if d > 0.01:
+                    cur.append(d)
+                else:
+                    if len(cur) > len(cn):
+                        cn = cur
+                    cur = []
+            if len(cur) > len(cn):
+                cn = cur
+            if len(cn) >= min_consec and sum(abs(d) for d in cn) >= total_min_rad:
+                left_curves_ignored += 1
+            ii += 1
+
+        if not right_blocks:
+            self.get_logger().info(
+                f'[RIGHT_CURVE_PROT] No right curves detected. '
+                f'Left curves ignored={left_curves_ignored}.'
+            )
+            return
+
+        # ── Apply protection ─────────────────────────────────────────────
+        offset_target = self.right_curve_protection_offset_m
+        offset_max = self.right_curve_protection_max_offset_m
+        max_range = self.right_curve_protection_distance_m
+        ramp_in = self.right_curve_protection_ramp_in_m
+        ramp_out = self.right_curve_protection_ramp_out_m
+        boundary_trigger = self.right_curve_boundary_trigger_m
+        check_step = self.right_curve_check_step_m
+        apply_pos = self.right_curve_apply_to_positions
+        apply_yaw = self.right_curve_apply_to_yaw
+        yaw_offset_rad = math.radians(self.right_curve_yaw_offset_deg)
+
+        modified_pos = 0
+        modified_yaw = 0
+        rejected_safe = 0
+        rejected_no_boundary = 0
+
+        def _dist(a, b):
+            return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+        for blk_start, blk_end in right_blocks:
+            # Compute arc-length within the block
+            arc_lengths = [0.0]
+            for k in range(blk_start + 1, blk_end + 1):
+                arc_lengths.append(
+                    arc_lengths[-1] + _dist(self.semi_goals[k - 1], self.semi_goals[k])
+                )
+            total_arc = arc_lengths[-1]
+            if total_arc < 1e-6:
+                continue
+
+            for k_rel, k in enumerate(range(blk_start, blk_end + 1)):
+                # Skip the very last goal
+                if k == N - 1:
+                    continue
+
+                arc = arc_lengths[k_rel]
+
+                # Ramp envelope
+                ramp_factor = 1.0
+                if arc < ramp_in and ramp_in > 0:
+                    ramp_factor = arc / ramp_in
+                elif arc > (total_arc - ramp_out) and ramp_out > 0:
+                    ramp_factor = (total_arc - arc) / ramp_out
+                ramp_factor = max(0.0, min(1.0, ramp_factor))
+                if ramp_factor <= 0.01:
+                    continue
+
+                mag = min(offset_target * ramp_factor, offset_max)
+
+                pt = self.semi_goals[k]
+                yaw_base = headings[k] if k < len(headings) else pt[2]
+
+                # Check right boundary
+                clearance = self._get_right_clearance(
+                    pt[0], pt[1], yaw_base,
+                    max_dist=boundary_trigger + 0.1,
+                    step=check_step
+                )
+
+                if clearance > boundary_trigger:
+                    rejected_no_boundary += 1
+                    continue
+
+                # ── Position offset ──────────────────────────────────────
+                if apply_pos and mag > 1e-4:
+                    left_x = -math.sin(yaw_base)
+                    left_y = math.cos(yaw_base)
+                    new_x = pt[0] + left_x * mag
+                    new_y = pt[1] + left_y * mag
+
+                    # Lane-safe validation
+                    safe = True
+                    if k > 0:
+                        prev = self.semi_goals[k - 1]
+                        safe = safe and self._is_segment_lane_safe(
+                            prev[0], prev[1], new_x, new_y, step=0.02
+                        )
+                    if k < N - 1:
+                        nxt = self.semi_goals[k + 1]
+                        safe = safe and self._is_segment_lane_safe(
+                            new_x, new_y, nxt[0], nxt[1], step=0.02
+                        )
+
+                    if safe:
+                        self.semi_goals[k] = (new_x, new_y, pt[2])
+                        modified_pos += 1
+                    else:
+                        rejected_safe += 1
+
+                # ── Optional yaw offset ──────────────────────────────────
+                if apply_yaw and ramp_factor > 0.01:
+                    x, y, yaw_cur = self.semi_goals[k]
+                    # For a right curve, open slightly left (positive yaw offset)
+                    yaw_adj = yaw_offset_rad * ramp_factor
+                    yaw_new = self._normalize_angle(yaw_cur + yaw_adj)
+                    self.semi_goals[k] = (x, y, yaw_new)
+                    modified_yaw += 1
+
+        # ── Logging ──────────────────────────────────────────────────────
+        block_strs = [f'[{s}-{e}]' for s, e in right_blocks]
+        self.get_logger().info(
+            f'[RIGHT_CURVE_PROT] right_curves={len(right_blocks)} {",".join(block_strs)}, '
+            f'left_ignored={left_curves_ignored}, '
+            f'pos_modified={modified_pos}, yaw_modified={modified_yaw}, '
+            f'rejected_safe={rejected_safe}, rejected_no_boundary={rejected_no_boundary}, '
+            f'max_offset={offset_max}m, N={N}'
         )
 
     # =====================================================================

@@ -125,6 +125,21 @@ directional_planner_server:
     post_curve_counteroffset_check_step_m: 0.02
     post_curve_counteroffset_direction: "left"
 
+    # --- Right Curve Protection (corrección lateral solo en curvas derechas) ---
+    use_right_curve_protection: true
+    right_curve_protection_offset_m: 0.07
+    right_curve_protection_max_offset_m: 0.12
+    right_curve_protection_distance_m: 0.80
+    right_curve_protection_ramp_in_m: 0.20
+    right_curve_protection_ramp_out_m: 0.25
+    right_curve_angle_threshold_deg: 8.0
+    right_curve_min_total_angle_deg: 12.0
+    right_curve_boundary_trigger_m: 0.30
+    right_curve_check_step_m: 0.02
+    right_curve_apply_to_positions: true
+    right_curve_apply_to_yaw: false
+    right_curve_yaw_offset_deg: 3.0
+
     # --- Auto-enable (set via launch, not here) ---
     auto_enable: false
 
