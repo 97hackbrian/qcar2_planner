@@ -115,7 +115,7 @@ class MapOverlayNode(Node):
 
         # ── Parameters ──────────────────────────────────────────────────────
         self.declare_parameter('map_yaml_path', '')
-        self.declare_parameter('alignment_mode', 'auto')
+        self.declare_parameter('alignment_mode', 'manual')
         self.declare_parameter('icp_max_iterations', 50)
         self.declare_parameter('icp_convergence_threshold', 0.001)
         self.declare_parameter('icp_max_correspondence_dist', 1.0)

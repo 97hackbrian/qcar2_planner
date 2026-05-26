@@ -37,7 +37,7 @@ def generate_launch_description():
     
     alignment_mode_arg = DeclareLaunchArgument(
         'alignment_mode',
-        default_value='auto',
+        default_value='manual', #cambiar aqui
         description='Alignment mode: auto (ICP) or manual (/initialpose)'
     )
 

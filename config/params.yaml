@@ -5,7 +5,7 @@
 map_overlay_node:
   ros__parameters:
     # --- Alignment Mode ---
-    alignment_mode: "auto" # 'auto' (ICP) or 'manual' (/initialpose)
+    alignment_mode: "manual" # 'auto' (ICP) or 'manual' (/initialpose)
     
     # --- ICP Parameters ---
     icp_max_iterations: 9666 # Maximos intentos (iteraciones) para lograr alinear los mapas
