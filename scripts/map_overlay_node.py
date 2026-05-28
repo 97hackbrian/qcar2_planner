@@ -199,12 +199,16 @@ class MapOverlayNode(Node):
         )
         self.occ_pub = self.create_publisher(OccupancyGrid, occ_topic, qos_latched)
         self.unc_pub = self.create_publisher(OccupancyGrid, unc_topic, qos_latched)
-        self.gm_pub = self.create_publisher(GridMapMsg, gm_topic, 10)
+        self.gm_pub = self.create_publisher(GridMapMsg, gm_topic, qos_latched)
 
         # ── Subscribers ─────────────────────────────────────────────────────
-        self.map_sub = self.create_subscription(
-            OccupancyGrid, '/map', self.cartographer_map_cb, qos_latched
-        )
+        if self.alignment_mode == 'auto':
+            self.map_sub = self.create_subscription(
+                OccupancyGrid, '/map', self.cartographer_map_cb, qos_latched
+            )
+            self._need_map_update = False
+        else:
+            self.map_sub = None
         self.initialpose_sub = self.create_subscription(
             PoseWithCovarianceStamped, '/initialpose', self.initialpose_cb, 10
         )
@@ -372,7 +376,13 @@ class MapOverlayNode(Node):
     # Callbacks
     # =====================================================================
     def cartographer_map_cb(self, msg: OccupancyGrid):
+        if self.alignment_mode == 'manual':
+            return
+            
         if self.transform_locked and self.alignment_mode == 'auto':
+            return
+            
+        if not getattr(self, '_need_map_update', False):
             return
 
         res = msg.info.resolution
@@ -412,6 +422,8 @@ class MapOverlayNode(Node):
                 pass
 
         self.carto_points = self._voxel_downsample(points, self.icp_ds_res)
+        self._need_map_update = False
+        self.get_logger().info(f'Captured Cartographer points once for ICP: {len(self.carto_points)}')
 
     def initialpose_cb(self, msg: PoseWithCovarianceStamped):
         # Allow /initialpose in BOTH modes.
@@ -443,6 +455,7 @@ class MapOverlayNode(Node):
                     self.get_logger().info(f'Manual alignment locked! TF: dx={dx:.2f}, dy={dy:.2f}, dth={math.degrees(dyaw):.1f}°')
                 else:
                     self.transform_locked = False # Unlock to let ICP run from this new seed
+                    self._need_map_update = True  # Trigger a single map update
                     self.get_logger().info(f'Seed alignment applied! ICP will now refine from: dx={dx:.2f}, dy={dy:.2f}, dth={math.degrees(dyaw):.1f}°')
             
         except Exception as e:
@@ -531,6 +544,9 @@ class MapOverlayNode(Node):
     # =====================================================================
     def _publish_all(self):
         try:
+            if getattr(self, '_published_once', False):
+                return
+                
             stamp = self.get_clock().now().to_msg()
             
             if self.pgm_occupancy is None: return
@@ -538,6 +554,9 @@ class MapOverlayNode(Node):
             self._pub_occ(stamp, self.pgm_occupancy, self.occ_pub, 100)
             self._pub_unc(stamp, self.pgm_occupancy, self.pgm_uncertainty)
             self._pub_gridmap(stamp, self.pgm_occupancy, self.pgm_uncertainty)
+            
+            self._published_once = True
+            self.get_logger().info('Static maps published successfully (Latched).')
             
         except Exception as e:
             self.get_logger().error(f'Publish error: {e}\n{traceback.format_exc()}')

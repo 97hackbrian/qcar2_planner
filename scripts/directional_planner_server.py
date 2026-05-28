@@ -47,6 +47,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 from grid_map_msgs.msg import GridMap as GridMapMsg
 from geometry_msgs.msg import PoseStamped, Point
@@ -830,8 +831,13 @@ class DirectionalPlannerServer(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ── Subscribers ─────────────────────────────────────────────────────
+        qos_latched = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.gridmap_sub = self.create_subscription(
-            GridMapMsg, '/grid_map', self.gridmap_callback, 10
+            GridMapMsg, '/grid_map', self.gridmap_callback, qos_latched
         )
         # Goal input subscriber
         self.goal_sub = self.create_subscription(
